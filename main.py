@@ -47,7 +47,6 @@ logging.basicConfig(
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 
-# Foydalanuvchi parallel so'rovlaridan himoya
 user_locks = defaultdict(asyncio.Lock)
 
 
@@ -64,9 +63,6 @@ class RegisterStates(StatesGroup):
     admin_search_by_id = State()
 
 
-# =========================
-# UMUMIY YORDAMCHI FUNKSIYALAR
-# =========================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -182,9 +178,6 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-# =========================
-# KANAL OBUNASI
-# =========================
 async def check_subscription(user_id: int) -> bool:
     if not REQUIRED_CHANNEL:
         return True
@@ -200,9 +193,6 @@ async def check_subscription(user_id: int) -> bool:
         return False
 
 
-# =========================
-# GOOGLE SHEETS
-# =========================
 def get_credentials():
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -537,20 +527,21 @@ async def get_recent_updates(limit: int = 10) -> List[dict]:
     for row in records:
         updated = normalize_text(row.get("Oxirgi yangilanish", ""))
         if updated:
+            student_value = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
+            group_value = normalize_text(row.get("Guruh", ""))
+            tg_id_value = normalize_text(row.get("Telegram ID", ""))
+
             result.append({
-                "student": normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", "")),
-                "group": normalize_text(row.get("Guruh", "")),
+                "student": student_value,
+                "group": group_value,
                 "updated": updated,
-                "telegram_id": normalize_text(row.get("Telegram ID", "")),
+                "telegram_id": tg_id_value,
             })
 
     result.sort(key=lambda x: x["updated"], reverse=True)
     return result[:limit]
 
 
-# =========================
-# OQIM YORDAMCHILARI
-# =========================
 async def cancel_flow(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
@@ -577,23 +568,27 @@ async def show_education_step(message: Message, state: FSMContext):
 async def show_confirm_step(message: Message, state: FSMContext):
     data = await state.get_data()
 
+    education_value = safe_html(data.get("education", ""))
+    course_value = safe_html(data.get("course", ""))
+    group_value = safe_html(data.get("group", ""))
+    student_value = safe_html(data.get("student", ""))
+    main_phone_value = safe_html(data.get("main_phone", ""))
+    extra_phone_value = safe_html(data.get("extra_phone", ""))
+
     await message.answer(
         "📝 <b>Kiritilgan ma'lumotlarni tekshiring:</b>\n\n"
-        f"🎓 Ta'lim shakli: <b>{safe_html(data.get('education', ''))}</b>\n"
-        f"📚 Kurs: <b>{safe_html(data.get('course', ''))}</b>\n"
-        f"👥 Guruh: <b>{safe_html(data.get('group', ''))}</b>\n"
-        f"🧑‍🎓 Talaba: <b>{safe_html(data.get('student', ''))}</b>\n"
-        f"📱 Asosiy raqam: <b>{safe_html(data.get('main_phone', ''))}</b>\n"
-        f"☎️ Qo'shimcha raqam: <b>{safe_html(data.get('extra_phone', ''))}</b>\n\n"
+        f"🎓 Ta'lim shakli: <b>{education_value}</b>\n"
+        f"📚 Kurs: <b>{course_value}</b>\n"
+        f"👥 Guruh: <b>{group_value}</b>\n"
+        f"🧑‍🎓 Talaba: <b>{student_value}</b>\n"
+        f"📱 Asosiy raqam: <b>{main_phone_value}</b>\n"
+        f"☎️ Qo'shimcha raqam: <b>{extra_phone_value}</b>\n\n"
         "✅ Tasdiqlaysizmi yoki ✏️ qayta kiritasizmi?",
         reply_markup=confirm_keyboard()
     )
     await state.set_state(RegisterStates.confirm_save)
 
 
-# =========================
-# FOYDALANUVCHI HANDLERLARI
-# =========================
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     try:
@@ -603,9 +598,10 @@ async def start_handler(message: Message, state: FSMContext):
 
         subscribed = await check_subscription(message.from_user.id)
         if not subscribed:
+            channel_value = safe_html(REQUIRED_CHANNEL)
             await message.answer(
                 "📢 <b>Botdan foydalanish uchun avval kanalga obuna bo‘ling.</b>\n\n"
-                f"🔗 Kanal: <b>{safe_html(REQUIRED_CHANNEL)}</b>\n\n"
+                f"🔗 Kanal: <b>{channel_value}</b>\n\n"
                 "✅ Obuna bo‘lgach, qayta /start bosing."
             )
             return
@@ -756,21 +752,24 @@ async def student_handler(message: Message, state: FSMContext):
 
         await state.update_data(student=student)
 
-        # Agar shu foydalanuvchi avval saqlagan bo'lsa, o'zgartirishga ruxsat
         if saved["telegram_id"] and message.from_user and saved["telegram_id"] == str(message.from_user.id):
             if saved["main_phone"] or saved["extra_phone"]:
+                main_value = safe_html(saved["main_phone"] or "-")
+                extra_value = safe_html(saved["extra_phone"] or "-")
+
                 await message.answer(
-                    f"ℹ️ <b>Bu talaba uchun oldin ma'lumot saqlangan.</b>\n\n"
-                    f"📱 Asosiy raqam: <b>{safe_html(saved['main_phone'] or '-')}</b>\n"
-                    f"☎️ Qo'shimcha raqam: <b>{safe_html(saved['extra_phone'] or '-')}</b>\n\n"
+                    "ℹ️ <b>Bu talaba uchun oldin ma'lumot saqlangan.</b>\n\n"
+                    f"📱 Asosiy raqam: <b>{main_value}</b>\n"
+                    f"☎️ Qo'shimcha raqam: <b>{extra_value}</b>\n\n"
                     "Qaysi qismini o'zgartirmoqchisiz?",
                     reply_markup=edit_choice_keyboard()
                 )
                 await state.set_state(RegisterStates.confirm_edit)
                 return
 
+        student_value = safe_html(student)
         await message.answer(
-            f"✅ <b>Tanlangan talaba:</b> {safe_html(student)}\n\n"
+            f"✅ <b>Tanlangan talaba:</b> {student_value}\n\n"
             "📱 <b>Endi ASOSIY raqamni yuboring</b>\n"
             "Format: <b>+998XXXXXXXXX</b>",
             reply_markup=contact_keyboard("📲 Asosiy raqamni kontakt qilib yuborish")
@@ -786,7 +785,6 @@ async def student_handler(message: Message, state: FSMContext):
 async def confirm_edit_handler(message: Message, state: FSMContext):
     try:
         text = normalize_text(message.text)
-        data = await state.get_data()
 
         if text == "📱 Asosiy raqamni o'zgartirish":
             await message.answer(
@@ -827,7 +825,6 @@ async def main_phone_contact_handler(message: Message, state: FSMContext):
             await message.answer("⚠️ Kontakt topilmadi.")
             return
 
-        # Xavfsizlik: faqat o'z kontaktini qabul qilamiz
         if message.contact.user_id and message.contact.user_id != message.from_user.id:
             await message.answer("⚠️ Faqat o'zingizning telefon raqamingizni yuboring.")
             return
@@ -984,14 +981,21 @@ async def confirm_save_handler(message: Message, state: FSMContext):
                 telegram_full_name=message.from_user.full_name or "",
             )
 
+        education_value = safe_html(data.get("education", ""))
+        course_value = safe_html(data.get("course", ""))
+        group_value = safe_html(data.get("group", ""))
+        student_value = safe_html(data.get("student", ""))
+        main_phone_value = safe_html(data.get("main_phone", ""))
+        extra_phone_value = safe_html(data.get("extra_phone", ""))
+
         await message.answer(
             "✅ <b>Ma'lumot muvaffaqiyatli saqlandi</b>\n\n"
-            f"🎓 Ta'lim shakli: <b>{safe_html(data.get('education', ''))}</b>\n"
-            f"📚 Kurs: <b>{safe_html(data.get('course', ''))}</b>\n"
-            f"👥 Guruh: <b>{safe_html(data.get('group', ''))}</b>\n"
-            f"🧑‍🎓 Talaba: <b>{safe_html(data.get('student', ''))}</b>\n"
-            f"📱 Asosiy raqam: <b>{safe_html(data.get('main_phone', ''))}</b>\n"
-            f"☎️ Qo'shimcha raqam: <b>{safe_html(data.get('extra_phone', ''))}</b>\n"
+            f"🎓 Ta'lim shakli: <b>{education_value}</b>\n"
+            f"📚 Kurs: <b>{course_value}</b>\n"
+            f"👥 Guruh: <b>{group_value}</b>\n"
+            f"🧑‍🎓 Talaba: <b>{student_value}</b>\n"
+            f"📱 Asosiy raqam: <b>{main_phone_value}</b>\n"
+            f"☎️ Qo'shimcha raqam: <b>{extra_phone_value}</b>\n"
             f"🆔 Telegram ID: <b>{message.from_user.id}</b>",
             reply_markup=ReplyKeyboardRemove()
         )
@@ -1002,14 +1006,6 @@ async def confirm_save_handler(message: Message, state: FSMContext):
         await message.answer(f"❌ {safe_html(str(e))}")
 
 
-@dp.message()
-async def fallback_handler(message: Message):
-    await message.answer("ℹ️ Qayta boshlash uchun /start bosing.")
-
-
-# =========================
-# ADMIN PANEL
-# =========================
 @dp.message(Command("admin"))
 async def admin_handler(message: Message, state: FSMContext):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1082,13 +1078,13 @@ async def admin_logs_handler(message: Message):
 
         top = []
         for row in records:
-            student = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
-            count = normalize_text(row.get(count_col_name, "0")) or "0"
-            if student:
+            student_name = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
+            count_value = normalize_text(row.get(count_col_name, "0")) or "0"
+            if student_name:
                 try:
-                    top.append((student, int(count)))
+                    top.append((student_name, int(count_value)))
                 except Exception:
-                    top.append((student, 0))
+                    top.append((student_name, 0))
 
         top.sort(key=lambda x: x[1], reverse=True)
         top = top[:10]
@@ -1134,13 +1130,22 @@ async def admin_search_handler(message: Message, state: FSMContext):
 
         chunks = []
         for item in results:
+            student_value = safe_html(item["student"])
+            group_value = safe_html(item["group"])
+            course_value = safe_html(item["course"])
+            education_value = safe_html(item["education"])
+            main_value = safe_html(item["main_phone"] or "-")
+            extra_value = safe_html(item["extra_phone"] or "-")
+            tg_id_value = safe_html(item["telegram_id"] or "-")
+            count_value = safe_html(item["count"] or "0")
+
             chunks.append(
-                f"🧑‍🎓 <b>{safe_html(item['student'])}</b>\n"
-                f"👥 {safe_html(item['group'])} | 📚 {safe_html(item['course'])} | 🎓 {safe_html(item['education'])}\n"
-                f"📱 {safe_html(item['main_phone'] or '-')}\n"
-                f"☎️ {safe_html(item['extra_phone'] or '-')}\n"
-                f"🆔 {safe_html(item['telegram_id'] or '-')}\n"
-                f"🧾 Yuborish soni: <b>{safe_html(item['count'] or '0')}</b>"
+                f"🧑‍🎓 <b>{student_value}</b>\n"
+                f"👥 {group_value} | 📚 {course_value} | 🎓 {education_value}\n"
+                f"📱 {main_value}\n"
+                f"☎️ {extra_value}\n"
+                f"🆔 {tg_id_value}\n"
+                f"🧾 Yuborish soni: <b>{count_value}</b>"
             )
 
         await message.answer(
@@ -1182,13 +1187,20 @@ async def admin_search_id_handler(message: Message, state: FSMContext):
         for row in records:
             tg_id = normalize_text(row.get("Telegram ID", ""))
             if tg_id == text:
+                fish_value = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
+                guruh_value = normalize_text(row.get("Guruh", ""))
+                kurs_value = normalize_text(row.get("Kurs", ""))
+                talim_value = normalize_text(row.get("Ta'lim shakli", ""))
+                asosiy_value = normalize_text(row.get("Asosiy nomer", "")) or "-"
+                qoshimcha_value = normalize_text(row.get("Qo'shimcha nomer", "")) or "-"
+
                 found.append(
-                    f"🧑‍🎓 <b>{safe_html(normalize_text(row.get('F.I.SH.', '')) or normalize_text(row.get('F.I.SH', '')))}</b>\n"
-                    f"👥 {safe_html(normalize_text(row.get('Guruh', '')))}\n"
-                    f"📚 {safe_html(normalize_text(row.get('Kurs', '')))}\n"
-                    f"🎓 {safe_html(normalize_text(row.get(\"Ta'lim shakli\", '')))}\n"
-                    f"📱 {safe_html(normalize_text(row.get('Asosiy nomer', '')) or '-')}\n"
-                    f"☎️ {safe_html(normalize_text(row.get(\"Qo'shimcha nomer\", '')) or '-')}\n"
+                    f"🧑‍🎓 <b>{safe_html(fish_value)}</b>\n"
+                    f"👥 {safe_html(guruh_value)}\n"
+                    f"📚 {safe_html(kurs_value)}\n"
+                    f"🎓 {safe_html(talim_value)}\n"
+                    f"📱 {safe_html(asosiy_value)}\n"
+                    f"☎️ {safe_html(qoshimcha_value)}\n"
                     f"🆔 {safe_html(tg_id)}"
                 )
 
