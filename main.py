@@ -3,600 +3,641 @@ import logging
 import os
 import re
 from datetime import datetime
-from io import BytesIO
+from typing import Dict, List, Optional
 
 import gspread
 import pandas as pd
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BufferedInputFile,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from google.oauth2.service_account import Credentials
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
+# =========================
+# CONFIG
+# =========================
+load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-}
-
-SPREADSHEET_ID = "1We8s8NcH4fDCHgH53EsGeO19g6Z2I9nMPBLppo8cTBA"
-WORKSHEET_NAME = "Sheet1"
-
-EXCEL_FILE = "students.xlsx"
-CREDENTIALS_FILE = "credentials.json"
-
-REQUIRED_COLUMNS = ["Ta'lim shakli", "Kurs", "Guruh", "F.I.SH."]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+EXCEL_FILE = os.getenv("EXCEL_FILE", "students.xlsx")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "StudentPhones")
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Telefonlar")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi")
+    raise ValueError("BOT_TOKEN topilmadi. .env yoki Railway Variables ga qo'ying.")
 
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def normalize_phone(phone_text: str):
-    phone = phone_text.strip()
-    phone = re.sub(r"[^\d+]", "", phone)
-
-    if re.fullmatch(r"\+998\d{9}", phone):
-        return phone
-    if re.fullmatch(r"998\d{9}", phone):
-        return "+" + phone
-    if re.fullmatch(r"\d{9}", phone):
-        return "+998" + phone
-
-    return None
-
-
-def make_keyboard(items, row_width=2, add_cancel=True):
-    rows = []
-    row = []
-
-    for item in items:
-        row.append(KeyboardButton(text=str(item)))
-        if len(row) == row_width:
-            rows.append(row)
-            row = []
-
-    if row:
-        rows.append(row)
-
-    if add_cancel:
-        rows.append([KeyboardButton(text="❌ Bekor qilish")])
-
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
-
-def load_students():
-    if not os.path.exists(EXCEL_FILE):
-        raise FileNotFoundError(f"{EXCEL_FILE} topilmadi")
-
-    df = pd.read_excel(EXCEL_FILE)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            raise ValueError(f"{EXCEL_FILE} ichida '{col}' ustuni yo'q")
-
-    df = df[REQUIRED_COLUMNS].copy().dropna()
-
-    for col in REQUIRED_COLUMNS:
-        df[col] = df[col].astype(str).str.strip()
-
-    df = df[
-        (df["Ta'lim shakli"] != "")
-        & (df["Kurs"] != "")
-        & (df["Guruh"] != "")
-        & (df["F.I.SH."] != "")
-    ].copy()
-
-    return df
-
-
-def connect_sheet():
-    if not os.path.exists(CREDENTIALS_FILE):
-        raise FileNotFoundError(f"{CREDENTIALS_FILE} topilmadi")
-
-    creds = Credentials.from_service_account_file(
-        CREDENTIALS_FILE,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-
-    client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-    return worksheet
-
-
-sheet = connect_sheet()
-students_df = load_students()
-
-
-def ensure_sheet_header():
-    values = sheet.get_all_values()
-    header = [
-        "created_at",
-        "updated_at",
-        "telegram_user_id",
-        "telegram_full_name",
-        "telegram_username",
-        "Ta'lim shakli",
-        "Kurs",
-        "Guruh",
-        "F.I.SH.",
-        "Asosiy raqam",
-        "Qo'shimcha raqam",
-    ]
-    if not values:
-        sheet.append_row(header)
-
-
-def get_all_records():
-    return sheet.get_all_records()
-
-
-def find_user_row(telegram_user_id: int):
-    records = get_all_records()
-    for idx, row in enumerate(records, start=2):
-        if str(row.get("telegram_user_id", "")).strip() == str(telegram_user_id):
-            return idx, row
-    return None, None
-
-
-def student_already_exists(talim: str, kurs: str, guruh: str, fio: str) -> bool:
-    records = get_all_records()
-    for row in records:
-        if (
-            str(row.get("Ta'lim shakli", "")).strip() == talim
-            and str(row.get("Kurs", "")).strip() == kurs
-            and str(row.get("Guruh", "")).strip() == guruh
-            and str(row.get("F.I.SH.", "")).strip() == fio
-        ):
-            return True
-    return False
-
-
-def save_result(data: dict):
-    sheet.append_row(
-        [
-            data["created_at"],
-            data["updated_at"],
-            data["telegram_user_id"],
-            data["telegram_full_name"],
-            data["telegram_username"],
-            data["Ta'lim shakli"],
-            data["Kurs"],
-            data["Guruh"],
-            data["F.I.SH."],
-            data["Asosiy raqam"],
-            data["Qo'shimcha raqam"],
-        ]
-    )
-
-
-def update_user_phones(telegram_user_id: int, main_phone: str, extra_phone: str) -> bool:
-    row_number, _ = find_user_row(telegram_user_id)
-    if not row_number:
-        return False
-
-    sheet.update_cell(row_number, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    sheet.update_cell(row_number, 10, main_phone)
-    sheet.update_cell(row_number, 11, extra_phone)
-    return True
-
-
-class RegisterForm(StatesGroup):
-    talim = State()
-    kurs = State()
-    guruh = State()
-    fio = State()
-    phone1 = State()
-    phone2 = State()
-
-
-class EditForm(StatesGroup):
-    phone1 = State()
-    phone2 = State()
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# Excel cache
+students_df: pd.DataFrame = pd.DataFrame()
 
-@dp.message(CommandStart())
-async def start_handler(message: Message, state: FSMContext):
-    await state.clear()
+# =========================
+# FSM
+# =========================
+class RegisterStates(StatesGroup):
+    choosing_education = State()
+    choosing_course = State()
+    choosing_group = State()
+    choosing_student = State()
+    choosing_number_type = State()
+    waiting_phone = State()
 
-    _, existing = find_user_row(message.from_user.id)
-    if existing:
-        await message.answer(
-            "✅ Siz allaqachon ma'lumot yuborgansiz.\n\n"
-            "📄 Ko‘rish: /myinfo\n"
-            "✏️ Tahrirlash: /edit"
-        )
-        return
 
-    talim_list = sorted(students_df["Ta'lim shakli"].unique().tolist())
-    if not talim_list:
-        await message.answer("⚠️ Talabalar ro'yxati hali kiritilmagan.")
-        return
+# =========================
+# HELPERS
+# =========================
+def normalize_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
-    await state.set_state(RegisterForm.talim)
-    await message.answer(
-        "👋 Assalomu alaykum!\n\n🎓 Ta'lim shaklini tanlang:",
-        reply_markup=make_keyboard(talim_list, row_width=2),
+
+def normalize_phone(phone: str) -> str:
+    phone = str(phone).strip()
+    phone = re.sub(r"[^\d+]", "", phone)
+
+    if phone.startswith("998") and not phone.startswith("+"):
+        phone = "+" + phone
+    elif phone.startswith("9") and len(phone) == 9:
+        phone = "+998" + phone
+    elif phone.startswith("8") and len(phone) >= 9:
+        # kerak bo'lsa o'zgartirsa bo'ladi
+        pass
+
+    return phone
+
+
+def make_reply_keyboard(items: List[str], buttons_per_row: int = 2, add_cancel: bool = True) -> ReplyKeyboardMarkup:
+    keyboard = []
+    row = []
+
+    for item in items:
+        row.append(KeyboardButton(text=item))
+        if len(row) == buttons_per_row:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    if add_cancel:
+        keyboard.append([KeyboardButton(text="❌ Bekor qilish")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
 
 
-@dp.message(Command("cancel"))
-async def cancel_command(message: Message, state: FSMContext):
+def contact_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📲 Kontakt yuborish", request_contact=True)],
+            [KeyboardButton(text="❌ Bekor qilish")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
+def load_students_excel() -> pd.DataFrame:
+    if not os.path.exists(EXCEL_FILE):
+        raise FileNotFoundError(f"{EXCEL_FILE} fayli topilmadi.")
+
+    df = pd.read_excel(EXCEL_FILE)
+    df.columns = [str(col).strip() for col in df.columns]
+
+    # barcha qiymatlarni silliqlab olamiz
+    for col in df.columns:
+        df[col] = df[col].apply(normalize_text)
+
+    return df
+
+
+def find_column(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
+    normalized_map = {col.lower().strip(): col for col in df.columns}
+
+    for alias in aliases:
+        key = alias.lower().strip()
+        if key in normalized_map:
+            return normalized_map[key]
+
+    return None
+
+
+def get_required_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Excel ustunlarini topadi.
+    Kerak bo'lsa aliases ga yana qo'shimcha nomlar qo'shsa bo'ladi.
+    """
+    education_col = find_column(df, [
+        "Ta'lim shakli", "Talim shakli", "ta'lim shakli", "talim shakli"
+    ])
+    course_col = find_column(df, [
+        "Kurs", "kurs"
+    ])
+    group_col = find_column(df, [
+        "Guruh", "Group", "group", "guruh"
+    ])
+    student_col = find_column(df, [
+        "F.I.SH", "FISH", "Fish", "Talaba", "Student", "Student Name",
+        "Full Name", "Ism familiya", "Familiya Ism", "FIO"
+    ])
+
+    missing = []
+    if not education_col:
+        missing.append("Ta'lim shakli")
+    if not course_col:
+        missing.append("Kurs")
+    if not group_col:
+        missing.append("Guruh")
+    if not student_col:
+        missing.append("Talaba F.I.SH")
+
+    if missing:
+        raise ValueError(
+            "Excel faylda kerakli ustun(lar) topilmadi: " + ", ".join(missing)
+        )
+
+    return {
+        "education": education_col,
+        "course": course_col,
+        "group": group_col,
+        "student": student_col,
+    }
+
+
+def get_unique_values(df: pd.DataFrame, column: str) -> List[str]:
+    values = [normalize_text(v) for v in df[column].dropna().tolist()]
+    values = [v for v in values if v]
+    unique_values = sorted(set(values), key=lambda x: str(x))
+    return unique_values
+
+
+def get_students_for_group(
+    df: pd.DataFrame,
+    education: str,
+    course: str,
+    group: str,
+    columns: Dict[str, str]
+) -> List[str]:
+    filtered = df[
+        (df[columns["education"]] == education) &
+        (df[columns["course"]] == course) &
+        (df[columns["group"]] == group)
+    ]
+
+    students = filtered[columns["student"]].dropna().tolist()
+    students = [normalize_text(s) for s in students if normalize_text(s)]
+    students = sorted(set(students))
+    return students
+
+
+def get_google_worksheet():
+    client = gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
+    spreadsheet = client.open(GOOGLE_SHEET_NAME)
+
+    try:
+        worksheet = spreadsheet.worksheet(GOOGLE_WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=GOOGLE_WORKSHEET_NAME, rows=2000, cols=15)
+        worksheet.append_row([
+            "Timestamp",
+            "Telegram ID",
+            "Telegram Full Name",
+            "Username",
+            "Ta'lim shakli",
+            "Kurs",
+            "Guruh",
+            "Talaba",
+            "Raqam turi",
+            "Telefon raqam"
+        ])
+
+    return worksheet
+
+
+def save_to_google_sheets(data: Dict[str, str]) -> None:
+    worksheet = get_google_worksheet()
+    records = worksheet.get_all_records()
+
+    existing_row_index = None
+    for i, row in enumerate(records, start=2):  # 1-qator header
+        if (
+            str(row.get("Talaba", "")).strip() == data["student"]
+            and str(row.get("Raqam turi", "")).strip() == data["number_type"]
+        ):
+            existing_row_index = i
+            break
+
+    row_values = [
+        data["timestamp"],
+        data["telegram_id"],
+        data["telegram_full_name"],
+        data["username"],
+        data["education"],
+        data["course"],
+        data["group"],
+        data["student"],
+        data["number_type"],
+        data["phone"],
+    ]
+
+    if existing_row_index:
+        worksheet.update(f"A{existing_row_index}:J{existing_row_index}", [row_values])
+    else:
+        worksheet.append_row(row_values)
+
+
+def get_number_type_buttons() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Asosiy nomer"), KeyboardButton(text="☎️ Qo'shimcha nomer")],
+            [KeyboardButton(text="❌ Bekor qilish")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
+async def cancel_flow(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "❌ Jarayon bekor qilindi.\nQayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Amal bekor qilindi. Qayta boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+# =========================
+# STARTUP
+# =========================
+async def on_startup():
+    global students_df
+    students_df = load_students_excel()
+    logging.info("students.xlsx yuklandi. Qatorlar soni: %s", len(students_df))
+
+
+# =========================
+# HANDLERS
+# =========================
+@dp.message(CommandStart())
+async def start_handler(message: Message, state: FSMContext):
+    try:
+        if students_df.empty:
+            await message.answer(
+                "Talabalar fayli topilmadi yoki bo'sh. Admin bilan bog'laning."
+            )
+            return
+
+        columns = get_required_columns(students_df)
+        educations = get_unique_values(students_df, columns["education"])
+
+        if not educations:
+            await message.answer("Ta'lim shakllari topilmadi.")
+            return
+
+        await state.clear()
+        await state.update_data(columns=columns)
+
+        await message.answer(
+            "🎓 Ta'lim shaklini tanlang:",
+            reply_markup=make_reply_keyboard(educations, buttons_per_row=2)
+        )
+        await state.set_state(RegisterStates.choosing_education)
+
+    except Exception as e:
+        logging.exception("start_handler xatolik: %s", e)
+        await message.answer("Botni ishga tushirishda xatolik bo'ldi.")
+
+
+@dp.message(Command("help"))
+async def help_handler(message: Message):
+    await message.answer(
+        "Botdan foydalanish tartibi:\n\n"
+        "1. /start bosing\n"
+        "2. Ta'lim shaklini tanlang\n"
+        "3. Kursni tanlang\n"
+        "4. Guruhni tanlang\n"
+        "5. Talabani tanlang\n"
+        "6. Raqam turini tanlang\n"
+        "7. Kontakt yuboring"
     )
 
 
 @dp.message(F.text == "❌ Bekor qilish")
-async def cancel_button(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ Jarayon bekor qilindi.\nQayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+async def cancel_handler(message: Message, state: FSMContext):
+    await cancel_flow(message, state)
 
 
-@dp.message(Command("id"))
-async def id_handler(message: Message):
-    await message.answer(f"🆔 Sizning Telegram ID: {message.from_user.id}")
+# =========================
+# CHOOSE EDUCATION
+# =========================
+@dp.message(RegisterStates.choosing_education, F.text)
+async def education_handler(message: Message, state: FSMContext):
+    data = await state.get_data()
+    columns = data["columns"]
+    education = message.text.strip()
 
-
-@dp.message(Command("myinfo"))
-async def myinfo_handler(message: Message):
-    _, row = find_user_row(message.from_user.id)
-
-    if not row:
-        await message.answer("ℹ️ Siz hali ma'lumot yubormagansiz. /start bosing.")
+    available = get_unique_values(students_df, columns["education"])
+    if education not in available:
+        await message.answer("Iltimos, tugmalardan birini tanlang.")
         return
 
-    text = (
-        "📄 Sizning ma'lumotlaringiz:\n\n"
-        f"🎓 Ta'lim shakli: {row.get(\"Ta'lim shakli\", '')}\n"
-        f"📚 Kurs: {row.get('Kurs', '')}\n"
-        f"👥 Guruh: {row.get('Guruh', '')}\n"
-        f"🧑‍🎓 F.I.SH.: {row.get('F.I.SH.', '')}\n"
-        f"📱 Asosiy raqam: {row.get('Asosiy raqam', '')}\n"
-        f"📲 Qo'shimcha raqam: {row.get('Qo'shimcha raqam', '')}"
-    )
-    await message.answer(text)
+    filtered = students_df[students_df[columns["education"]] == education]
+    courses = get_unique_values(filtered, columns["course"])
 
-
-@dp.message(Command("edit"))
-async def edit_handler(message: Message, state: FSMContext):
-    _, row = find_user_row(message.from_user.id)
-
-    if not row:
-        await message.answer("ℹ️ Siz hali ma'lumot yubormagansiz. /start bosing.")
+    if not courses:
+        await message.answer("Bu ta'lim shakli uchun kurslar topilmadi.")
         return
 
-    await state.clear()
-    await state.set_state(EditForm.phone1)
+    await state.update_data(education=education)
+
     await message.answer(
-        "✏️ Raqamlarni tahrirlash boshlandi.\n\n"
-        "📱 Yangi asosiy raqamni kiriting:\n"
-        "Masalan: 901234567 yoki +998901234567",
-        reply_markup=ReplyKeyboardRemove(),
+        "📚 Kursni tanlang:",
+        reply_markup=make_reply_keyboard(courses, buttons_per_row=3)
     )
+    await state.set_state(RegisterStates.choosing_course)
 
 
-@dp.message(RegisterForm.talim)
-async def talim_handler(message: Message, state: FSMContext):
-    value = message.text.strip()
-    talim_list = sorted(students_df["Ta'lim shakli"].unique().tolist())
+# =========================
+# CHOOSE COURSE
+# =========================
+@dp.message(RegisterStates.choosing_course, F.text)
+async def course_handler(message: Message, state: FSMContext):
+    data = await state.get_data()
+    columns = data["columns"]
+    education = data["education"]
+    course = message.text.strip()
 
-    if value not in talim_list:
-        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
+    filtered = students_df[students_df[columns["education"]] == education]
+    courses = get_unique_values(filtered, columns["course"])
+
+    if course not in courses:
+        await message.answer("Iltimos, kursni tugmalardan tanlang.")
         return
 
-    await state.update_data(talim=value)
+    filtered = students_df[
+        (students_df[columns["education"]] == education) &
+        (students_df[columns["course"]] == course)
+    ]
+    groups = get_unique_values(filtered, columns["group"])
 
-    courses = sorted(
-        students_df[students_df["Ta'lim shakli"] == value]["Kurs"].unique().tolist(),
-        key=lambda x: str(x),
-    )
+    if not groups:
+        await message.answer("Bu kurs uchun guruhlar topilmadi.")
+        return
 
-    await state.set_state(RegisterForm.kurs)
+    await state.update_data(course=course)
+
     await message.answer(
-        "📚 Kursingizni tanlang:",
-        reply_markup=make_keyboard(courses, row_width=3),
+        "👥 Guruhni tanlang:",
+        reply_markup=make_reply_keyboard(groups, buttons_per_row=2)
+    )
+    await state.set_state(RegisterStates.choosing_group)
+
+
+# =========================
+# CHOOSE GROUP
+# =========================
+@dp.message(RegisterStates.choosing_group, F.text)
+async def group_handler(message: Message, state: FSMContext):
+    data = await state.get_data()
+    columns = data["columns"]
+    education = data["education"]
+    course = data["course"]
+    group = message.text.strip()
+
+    filtered = students_df[
+        (students_df[columns["education"]] == education) &
+        (students_df[columns["course"]] == course)
+    ]
+    groups = get_unique_values(filtered, columns["group"])
+
+    if group not in groups:
+        await message.answer("Iltimos, guruhni tugmalardan tanlang.")
+        return
+
+    students = get_students_for_group(
+        students_df,
+        education=education,
+        course=course,
+        group=group,
+        columns=columns
     )
 
+    if not students:
+        await message.answer("Bu guruhda talabalar topilmadi.")
+        return
 
-@dp.message(RegisterForm.kurs)
-async def kurs_handler(message: Message, state: FSMContext):
-    value = message.text.strip()
+    await state.update_data(group=group)
+
+    students_text = "\n".join([f"• {s}" for s in students[:50]])
+    await message.answer(
+        f"🧑‍🎓 {group} guruhidagi talabalar:\n\n{students_text}"
+    )
+
+    await message.answer(
+        "Talabani tanlang:",
+        reply_markup=make_reply_keyboard(students, buttons_per_row=1)
+    )
+    await state.set_state(RegisterStates.choosing_student)
+
+
+# =========================
+# CHOOSE STUDENT
+# =========================
+@dp.message(RegisterStates.choosing_student, F.text)
+async def student_handler(message: Message, state: FSMContext):
+    data = await state.get_data()
+    columns = data["columns"]
+    education = data["education"]
+    course = data["course"]
+    group = data["group"]
+    student = message.text.strip()
+
+    students = get_students_for_group(
+        students_df,
+        education=education,
+        course=course,
+        group=group,
+        columns=columns
+    )
+
+    if student not in students:
+        await message.answer("Iltimos, talabani tugmalardan tanlang.")
+        return
+
+    await state.update_data(student=student)
+
+    await message.answer(
+        f"✅ Tanlangan talaba: {student}\n\nRaqam turini tanlang:",
+        reply_markup=get_number_type_buttons()
+    )
+    await state.set_state(RegisterStates.choosing_number_type)
+
+
+# =========================
+# CHOOSE NUMBER TYPE
+# =========================
+@dp.message(RegisterStates.choosing_number_type, F.text)
+async def number_type_handler(message: Message, state: FSMContext):
+    text = message.text.strip()
+
+    allowed = ["📱 Asosiy nomer", "☎️ Qo'shimcha nomer"]
+    if text not in allowed:
+        await message.answer("Iltimos, pastdagi tugmalardan birini tanlang.")
+        return
+
+    await state.update_data(number_type=text)
+
+    await message.answer(
+        "📞 Endi telefon raqamni kontakt ko'rinishida yuboring:",
+        reply_markup=contact_keyboard()
+    )
+    await state.set_state(RegisterStates.waiting_phone)
+
+
+# =========================
+# PHONE RECEIVE
+# =========================
+@dp.message(RegisterStates.waiting_phone, F.contact)
+async def contact_phone_handler(message: Message, state: FSMContext):
+    contact = message.contact
+
+    if not contact:
+        await message.answer("Kontakt topilmadi.")
+        return
+
+    phone = normalize_phone(contact.phone_number)
     data = await state.get_data()
 
-    courses = sorted(
-        students_df[students_df["Ta'lim shakli"] == data["talim"]]["Kurs"].unique().tolist(),
-        key=lambda x: str(x),
-    )
-    courses = [str(x) for x in courses]
-
-    if value not in courses:
-        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
-        return
-
-    await state.update_data(kurs=value)
-
-    groups = sorted(
-        students_df[
-            (students_df["Ta'lim shakli"] == data["talim"])
-            & (students_df["Kurs"].astype(str) == value)
-        ]["Guruh"].unique().tolist()
-    )
-
-    await state.set_state(RegisterForm.guruh)
-    await message.answer(
-        "👥 Guruhingizni tanlang:",
-        reply_markup=make_keyboard(groups, row_width=3),
-    )
-
-
-@dp.message(RegisterForm.guruh)
-async def guruh_handler(message: Message, state: FSMContext):
-    value = message.text.strip()
-    data = await state.get_data()
-
-    groups = sorted(
-        students_df[
-            (students_df["Ta'lim shakli"] == data["talim"])
-            & (students_df["Kurs"].astype(str) == data["kurs"])
-        ]["Guruh"].unique().tolist()
-    )
-
-    if value not in groups:
-        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
-        return
-
-    await state.update_data(guruh=value)
-
-    names = sorted(
-        students_df[
-            (students_df["Ta'lim shakli"] == data["talim"])
-            & (students_df["Kurs"].astype(str) == data["kurs"])
-            & (students_df["Guruh"] == value)
-        ]["F.I.SH."].unique().tolist()
-    )
-
-    await state.set_state(RegisterForm.fio)
-    await message.answer(
-        "🧑‍🎓 F.I.SH. ni tanlang:",
-        reply_markup=make_keyboard(names, row_width=1),
-    )
-
-
-@dp.message(RegisterForm.fio)
-async def fio_handler(message: Message, state: FSMContext):
-    value = message.text.strip()
-    data = await state.get_data()
-
-    names = sorted(
-        students_df[
-            (students_df["Ta'lim shakli"] == data["talim"])
-            & (students_df["Kurs"].astype(str) == data["kurs"])
-            & (students_df["Guruh"] == data["guruh"])
-        ]["F.I.SH."].unique().tolist()
-    )
-
-    if value not in names:
-        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
-        return
-
-    if student_already_exists(
-        talim=data["talim"],
-        kurs=data["kurs"],
-        guruh=data["guruh"],
-        fio=value,
-    ):
-        await state.clear()
-        await message.answer("⚠️ Bu talaba uchun ma'lumot allaqachon kiritilgan.")
-        return
-
-    await state.update_data(fio=value)
-
-    await state.set_state(RegisterForm.phone1)
-    await message.answer(
-        "📱 Asosiy raqamni kiriting.\n\n"
-        "Masalan: 901234567 yoki +998901234567",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@dp.message(RegisterForm.phone1)
-async def phone1_handler(message: Message, state: FSMContext):
-    phone = normalize_phone(message.text)
-
-    if not phone:
-        await message.answer(
-            "❌ Asosiy raqam noto‘g‘ri.\n"
-            "Masalan: 901234567 yoki +998901234567"
-        )
-        return
-
-    await state.update_data(phone1=phone)
-
-    await state.set_state(RegisterForm.phone2)
-    await message.answer(
-        "📲 Qo'shimcha raqamni kiriting.\n\n"
-        "Masalan: 901234567 yoki +998901234567"
-    )
-
-
-@dp.message(RegisterForm.phone2)
-async def phone2_handler(message: Message, state: FSMContext):
-    phone = normalize_phone(message.text)
-
-    if not phone:
-        await message.answer(
-            "❌ Qo‘shimcha raqam noto‘g‘ri.\n"
-            "Masalan: 901234567 yoki +998901234567"
-        )
-        return
-
-    data = await state.get_data()
-
-    row_data = {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "telegram_user_id": message.from_user.id,
-        "telegram_full_name": message.from_user.full_name,
-        "telegram_username": message.from_user.username or "",
-        "Ta'lim shakli": data["talim"],
-        "Kurs": data["kurs"],
-        "Guruh": data["guruh"],
-        "F.I.SH.": data["fio"],
-        "Asosiy raqam": data["phone1"],
-        "Qo'shimcha raqam": phone,
+    payload = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "telegram_id": str(message.from_user.id) if message.from_user else "",
+        "telegram_full_name": message.from_user.full_name if message.from_user else "",
+        "username": message.from_user.username if message.from_user and message.from_user.username else "",
+        "education": data.get("education", ""),
+        "course": data.get("course", ""),
+        "group": data.get("group", ""),
+        "student": data.get("student", ""),
+        "number_type": data.get("number_type", ""),
+        "phone": phone,
     }
 
-    save_result(row_data)
-    await state.clear()
+    try:
+        save_to_google_sheets(payload)
 
-    await message.answer(
-        "✅ Ma'lumotlaringiz muvaffaqiyatli saqlandi!\n\n"
-        "📄 Ko‘rish: /myinfo\n"
-        "✏️ Tahrirlash: /edit"
-    )
-
-
-@dp.message(EditForm.phone1)
-async def edit_phone1_handler(message: Message, state: FSMContext):
-    phone = normalize_phone(message.text)
-
-    if not phone:
         await message.answer(
-            "❌ Asosiy raqam noto‘g‘ri.\n"
-            "Masalan: 901234567 yoki +998901234567"
+            "✅ Ma'lumot muvaffaqiyatli saqlandi.\n\n"
+            f"🎓 Ta'lim shakli: {payload['education']}\n"
+            f"📚 Kurs: {payload['course']}\n"
+            f"👥 Guruh: {payload['group']}\n"
+            f"🧑‍🎓 Talaba: {payload['student']}\n"
+            f"🏷 Raqam turi: {payload['number_type']}\n"
+            f"📞 Telefon: {payload['phone']}",
+            reply_markup=ReplyKeyboardRemove()
         )
+        await state.clear()
+
+    except Exception as e:
+        logging.exception("Google Sheets ga yozishda xatolik: %s", e)
+        await message.answer(
+            "Ma'lumotni Google Sheets ga yozishda xatolik bo'ldi.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+
+@dp.message(RegisterStates.waiting_phone, F.text)
+async def text_phone_handler(message: Message, state: FSMContext):
+    text = message.text.strip()
+
+    if text == "❌ Bekor qilish":
+        await cancel_flow(message, state)
         return
 
-    await state.update_data(phone1=phone)
-    await state.set_state(EditForm.phone2)
+    phone = normalize_phone(text)
 
-    await message.answer(
-        "📲 Yangi qo‘shimcha raqamni kiriting:\n"
-        "Masalan: 901234567 yoki +998901234567"
-    )
-
-
-@dp.message(EditForm.phone2)
-async def edit_phone2_handler(message: Message, state: FSMContext):
-    phone = normalize_phone(message.text)
-
-    if not phone:
+    if not re.fullmatch(r"^\+?\d{9,15}$", phone):
         await message.answer(
-            "❌ Qo‘shimcha raqam noto‘g‘ri.\n"
-            "Masalan: 901234567 yoki +998901234567"
+            "Telefon raqam noto'g'ri formatda.\n"
+            "Kontakt yuboring yoki raqamni to'g'ri kiriting.\n\n"
+            "Masalan: +998901234567"
         )
         return
 
     data = await state.get_data()
-    ok = update_user_phones(
-        telegram_user_id=message.from_user.id,
-        main_phone=data["phone1"],
-        extra_phone=phone,
-    )
 
-    await state.clear()
+    payload = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "telegram_id": str(message.from_user.id) if message.from_user else "",
+        "telegram_full_name": message.from_user.full_name if message.from_user else "",
+        "username": message.from_user.username if message.from_user and message.from_user.username else "",
+        "education": data.get("education", ""),
+        "course": data.get("course", ""),
+        "group": data.get("group", ""),
+        "student": data.get("student", ""),
+        "number_type": data.get("number_type", ""),
+        "phone": phone,
+    }
 
-    if ok:
+    try:
+        save_to_google_sheets(payload)
+
         await message.answer(
-            "✅ Raqamlar muvaffaqiyatli yangilandi!\n\n📄 Ko‘rish: /myinfo"
+            "✅ Ma'lumot muvaffaqiyatli saqlandi.\n\n"
+            f"🎓 Ta'lim shakli: {payload['education']}\n"
+            f"📚 Kurs: {payload['course']}\n"
+            f"👥 Guruh: {payload['group']}\n"
+            f"🧑‍🎓 Talaba: {payload['student']}\n"
+            f"🏷 Raqam turi: {payload['number_type']}\n"
+            f"📞 Telefon: {payload['phone']}",
+            reply_markup=ReplyKeyboardRemove()
         )
-    else:
-        await message.answer("❌ Tahrirlashda xatolik bo‘ldi.")
+        await state.clear()
+
+    except Exception as e:
+        logging.exception("Google Sheets ga yozishda xatolik: %s", e)
+        await message.answer(
+            "Ma'lumotni Google Sheets ga yozishda xatolik bo'ldi.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
-@dp.message(Command("stat"))
-async def stat_handler(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Sizda bu buyruq uchun ruxsat yo'q.")
-        return
-
-    records = get_all_records()
-    total = len(records)
-
-    if total == 0:
-        await message.answer("📊 Hozircha ma'lumot yo'q.")
-        return
-
-    df = pd.DataFrame(records)
-
-    talim_stats = df["Ta'lim shakli"].value_counts().to_dict() if "Ta'lim shakli" in df else {}
-    kurs_stats = df["Kurs"].value_counts().to_dict() if "Kurs" in df else {}
-
-    text = [f"📊 Jami topshirilganlar: {total}\n"]
-
-    text.append("🎓 Ta'lim shakli bo'yicha:")
-    for k, v in talim_stats.items():
-        text.append(f"• {k}: {v}")
-
-    text.append("\n📚 Kurs bo'yicha:")
-    for k, v in kurs_stats.items():
-        text.append(f"• {k}: {v}")
-
-    await message.answer("\n".join(text))
-
-
-@dp.message(Command("excel"))
-async def excel_handler(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Sizda bu buyruq uchun ruxsat yo'q.")
-        return
-
-    records = get_all_records()
-    if not records:
-        await message.answer("📄 Eksport qilish uchun ma'lumot yo'q.")
-        return
-
-    df = pd.DataFrame(records)
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Telefonlar", index=False)
-
-    output.seek(0)
-
-    file = BufferedInputFile(
-        output.read(),
-        filename=f"telefonlar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+# =========================
+# FALLBACK
+# =========================
+@dp.message()
+async def fallback_handler(message: Message):
+    await message.answer(
+        "Qayta boshlash uchun /start bosing."
     )
 
-    await message.answer_document(file, caption="📥 Excel eksport tayyor")
 
-
+# =========================
+# MAIN
+# =========================
 async def main():
-    ensure_sheet_header()
+    await on_startup()
+    logging.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot to'xtatildi.")
