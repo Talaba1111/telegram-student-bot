@@ -1,70 +1,134 @@
-import asyncio
+[15.03.2026 13:27] Safarov Jasur: import asyncio
 import json
 import logging
 import os
 import re
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 
-import pandas as pd
 import gspread
-
+import pandas as pd
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    BufferedInputFile,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Talabalar Telefonlari").strip()
 GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+
+INPUT_FILE = "students.xlsx"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi")
 
-if not GOOGLE_SHEET_NAME:
-    raise ValueError("GOOGLE_SHEET_NAME topilmadi")
-
-if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON topilmadi")
-
-INPUT_FILE = "students.xlsx"
+REQUIRED_COLUMNS = ["Ta'lim shakli", "Kurs", "Guruh", "F.I.SH."]
 
 
-def load_students():
+# =========================
+# YORDAMCHI FUNKSIYALAR
+# =========================
+def make_keyboard(items, row_width=2, add_cancel=True):
+    rows = []
+    row = []
+
+    for item in items:
+        row.append(KeyboardButton(text=str(item)))
+        if len(row) == row_width:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    if add_cancel:
+        rows.append([KeyboardButton(text="❌ Bekor qilish")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def normalize_phone(phone_text: str) -> str | None:
+    phone = phone_text.strip()
+    phone = re.sub(r"[^\d+]", "", phone)
+
+    if re.fullmatch(r"\+998\d{9}", phone):
+        return phone
+    if re.fullmatch(r"998\d{9}", phone):
+        return f"+{phone}"
+    if re.fullmatch(r"\d{9}", phone):
+        return f"+998{phone}"
+
+    return None
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def load_students() -> pd.DataFrame:
     if not os.path.exists(INPUT_FILE):
         raise FileNotFoundError(f"{INPUT_FILE} topilmadi")
 
     df = pd.read_excel(INPUT_FILE)
     df.columns = [str(c).strip() for c in df.columns]
 
-    required_cols = ["Ta'lim shakli", "Kurs", "Guruh", "F.I.SH."]
-    for col in required_cols:
+    for col in REQUIRED_COLUMNS:
         if col not in df.columns:
             raise ValueError(f"{INPUT_FILE} ichida '{col}' ustuni yo'q")
 
-    df = df[required_cols].copy().dropna()
+    df = df[REQUIRED_COLUMNS].copy().dropna()
 
-    for col in required_cols:
+    for col in REQUIRED_COLUMNS:
         df[col] = df[col].astype(str).str.strip()
 
-    # bo'sh satrlarni olib tashlash
     df = df[
-        (df["Ta'lim shakli"] != "") &
-        (df["Kurs"] != "") &
-        (df["Guruh"] != "") &
-        (df["F.I.SH."] != "")
+        (df["Ta'lim shakli"] != "")
+        & (df["Kurs"] != "")
+        & (df["Guruh"] != "")
+        & (df["F.I.SH."] != "")
     ].copy()
 
     return df
 
 
+# =========================
+# GOOGLE SHEETS
+# =========================
 def get_gspread_client():
-    creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    return gspread.service_account_from_dict(creds)
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        return gspread.service_account_from_dict(creds_dict)
+
+    if GOOGLE_CREDENTIALS_FILE and Path(GOOGLE_CREDENTIALS_FILE).exists():
+        return gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
+
+    json_files = list(Path(".").glob("*.json"))
+    if json_files:
+        return gspread.service_account(filename=str(json_files[0]))
+
+    raise ValueError(
+        "Google credentials topilmadi. GOOGLE_SERVICE_ACCOUNT_JSON yoki json fayl kerak."
+    )
 
 
 def get_worksheet():
@@ -80,7 +144,9 @@ def ensure_sheet_header():
 
     header = [
         "created_at",
+        "updated_at",
         "telegram_user_id",
+        "telegram_full_name",
         "telegram_username",
         "Ta'lim shakli",
         "Kurs",
@@ -88,135 +154,210 @@ def ensure_sheet_header():
         "F.I.SH.",
         "Asosiy raqam",
         "Qo'shimcha raqam",
-        "Ota-onasining raqami",
     ]
-
-    if not values:
+[15.03.2026 13:27] Safarov Jasur: if not values:
         ws.append_row(header)
+
+
+def get_all_records():
+    ws = get_worksheet()
+    return ws.get_all_records()
+
+
+def find_user_row(telegram_user_id: int):
+    ws = get_worksheet()
+    records = ws.get_all_records()
+
+    for idx, row in enumerate(records, start=2):
+        if str(row.get("telegram_user_id", "")).strip() == str(telegram_user_id):
+            return idx, row
+
+    return None, None
+
+
+def student_already_exists(talim: str, kurs: str, guruh: str, fio: str) -> bool:
+    records = get_all_records()
+
+    for row in records:
+        if (
+            str(row.get("Ta'lim shakli", "")).strip() == talim
+            and str(row.get("Kurs", "")).strip() == kurs
+            and str(row.get("Guruh", "")).strip() == guruh
+            and str(row.get("F.I.SH.", "")).strip() == fio
+        ):
+            return True
+    return False
 
 
 def save_result(data: dict):
     ws = get_worksheet()
-    ws.append_row([
-        data["created_at"],
-        data["telegram_user_id"],
-        data["telegram_username"],
-        data["Ta'lim shakli"],
-        data["Kurs"],
-        data["Guruh"],
-        data["F.I.SH."],
-        data["Asosiy raqam"],
-        data["Qo'shimcha raqam"],
-        data["Ota-onasining raqami"],
-    ])
-
-
-def normalize_phone(phone_text: str):
-    """
-    9 xonali raqam kiritilsa avtomatik +998 qo'shiladi.
-    """
-    phone = phone_text.strip()
-    phone = re.sub(r"[^\d+]", "", phone)
-
-    if re.fullmatch(r"\+998\d{9}", phone):
-        return phone
-    if re.fullmatch(r"998\d{9}", phone):
-        return "+" + phone
-    if re.fullmatch(r"\d{9}", phone):
-        return "+998" + phone
-
-    return None
-
-
-def make_keyboard(items, row_width=2, add_cancel=True):
-    rows = []
-    row = []
-
-    for item in items:
-        row.append(KeyboardButton(text=str(item)))
-        if len(row) == row_width:
-            rows.append(row)
-            row = []
-
-    if row:
-        rows.append(row)
-
-    if add_cancel:
-        rows.append([KeyboardButton(text="Bekor qilish")])
-
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        one_time_keyboard=True
+    ws.append_row(
+        [
+            data["created_at"],
+            data["updated_at"],
+            data["telegram_user_id"],
+            data["telegram_full_name"],
+            data["telegram_username"],
+            data["Ta'lim shakli"],
+            data["Kurs"],
+            data["Guruh"],
+            data["F.I.SH."],
+            data["Asosiy raqam"],
+            data["Qo'shimcha raqam"],
+        ]
     )
 
 
+def update_user_phones(telegram_user_id: int, main_phone: str, extra_phone: str) -> bool:
+    ws = get_worksheet()
+    row_number, _ = find_user_row(telegram_user_id)
+
+    if not row_number:
+        return False
+
+    # B = updated_at, J = Asosiy raqam, K = Qo'shimcha raqam
+    ws.update_cell(row_number, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    ws.update_cell(row_number, 10, main_phone)
+    ws.update_cell(row_number, 11, extra_phone)
+    return True
+
+
+# =========================
+# DATA
+# =========================
 students_df = load_students()
 
 
+# =========================
+# STATES
+# =========================
 class Form(StatesGroup):
     talim = State()
     kurs = State()
     guruh = State()
     fio = State()
-    choose_phone_action = State()
-    enter_main_phone = State()
-    enter_extra_phone = State()
-    enter_parent_phone = State()
+    main_phone = State()
+    extra_phone = State()
 
 
+class EditForm(StatesGroup):
+    main_phone = State()
+    extra_phone = State()
+
+
+# =========================
+# BOT
+# =========================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# =========================
+# USER COMMANDS
+# =========================
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
 
+    _, existing = find_user_row(message.from_user.id)
+    if existing:
+        await message.answer(
+            "✅ Siz allaqachon ma'lumot yuborgansiz.\n\n"
+            "📄 Ko‘rish: /myinfo\n"
+            "✏️ Tahrirlash: /edit"
+        )
+        return
+
     talim_list = sorted(students_df["Ta'lim shakli"].unique().tolist())
 
     if not talim_list:
-        await message.answer(
-            "Talabalar ro'yxati hali kiritilmagan. Administrator students.xlsx faylni to'ldirishi kerak."
-        )
+        await message.answer("⚠️ Talabalar ro'yxati hali kiritilmagan.")
         return
 
     await state.set_state(Form.talim)
     await message.answer(
-        "Assalomu alaykum.\nTa'lim shaklini tanlang:",
-        reply_markup=make_keyboard(talim_list, row_width=2)
+        "👋 Assalomu alaykum!\n\n🎓 Ta'lim shaklini tanlang:",
+        reply_markup=make_keyboard(talim_list, row_width=2),
     )
 
 
-@dp.message(F.text == "Bekor qilish")
+@dp.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "❌ Jarayon bekor qilindi.\nQayta boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(F.text == "❌ Bekor qilish")
 async def cancel_handler(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Jarayon bekor qilindi. Qayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove()
+        "❌ Jarayon bekor qilindi.\nQayta boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
+@dp.message(Command("myinfo"))
+async def myinfo_handler(message: Message):
+    _, row = find_user_row(message.from_user.id)
+
+    if not row:
+        await message.answer("ℹ️ Siz hali ma'lumot yubormagansiz. /start bosing.")
+        return
+[15.03.2026 13:27] Safarov Jasur: text = (
+        "📄 Sizning saqlangan ma'lumotlaringiz:\n\n"
+        f"🎓 Ta'lim shakli: {row.get(\"Ta'lim shakli\", '')}\n"
+        f"📚 Kurs: {row.get('Kurs', '')}\n"
+        f"👥 Guruh: {row.get('Guruh', '')}\n"
+        f"🧑‍🎓 F.I.SH.: {row.get('F.I.SH.', '')}\n"
+        f"📱 Asosiy raqam: {row.get('Asosiy raqam', '')}\n"
+        f"📲 Qo'shimcha raqam: {row.get('Qo'shimcha raqam', '')}"
+    )
+    await message.answer(text)
+
+
+@dp.message(Command("edit"))
+async def edit_handler(message: Message, state: FSMContext):
+    _, row = find_user_row(message.from_user.id)
+
+    if not row:
+        await message.answer("ℹ️ Siz hali ma'lumot yubormagansiz. /start bosing.")
+        return
+
+    await state.clear()
+    await state.set_state(EditForm.main_phone)
+    await message.answer(
+        "✏️ Raqamlarni qayta tahrirlash boshlandi.\n\n"
+        "📱 Yangi asosiy raqamni kiriting:\n"
+        "Misol: 901234567 yoki +998901234567"
+    )
+
+
+# =========================
+# RO‘YXATDAN O‘TISH
+# =========================
 @dp.message(Form.talim)
 async def talim_handler(message: Message, state: FSMContext):
     value = message.text.strip()
     talim_list = sorted(students_df["Ta'lim shakli"].unique().tolist())
 
     if value not in talim_list:
-        await message.answer("Ro'yxatdan birini tanlang.")
+        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
         return
 
     await state.update_data(talim=value)
 
     courses = sorted(
         students_df[students_df["Ta'lim shakli"] == value]["Kurs"].unique().tolist(),
-        key=lambda x: str(x)
+        key=lambda x: str(x),
     )
 
     await state.set_state(Form.kurs)
     await message.answer(
-        "Kursni tanlang:",
-        reply_markup=make_keyboard(courses, row_width=3)
+        "📚 Kursingizni tanlang:",
+        reply_markup=make_keyboard(courses, row_width=3),
     )
 
 
@@ -227,27 +368,27 @@ async def kurs_handler(message: Message, state: FSMContext):
 
     courses = sorted(
         students_df[students_df["Ta'lim shakli"] == data["talim"]]["Kurs"].unique().tolist(),
-        key=lambda x: str(x)
+        key=lambda x: str(x),
     )
     courses = [str(x) for x in courses]
 
     if value not in courses:
-        await message.answer("Ro'yxatdan birini tanlang.")
+        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
         return
 
     await state.update_data(kurs=value)
 
     groups = sorted(
         students_df[
-            (students_df["Ta'lim shakli"] == data["talim"]) &
-            (students_df["Kurs"].astype(str) == value)
+            (students_df["Ta'lim shakli"] == data["talim"])
+            & (students_df["Kurs"].astype(str) == value)
         ]["Guruh"].unique().tolist()
     )
 
     await state.set_state(Form.guruh)
     await message.answer(
-        "Guruhni tanlang:",
-        reply_markup=make_keyboard(groups, row_width=3)
+        "👥 Guruhingizni tanlang:",
+        reply_markup=make_keyboard(groups, row_width=3),
     )
 
 
@@ -258,29 +399,29 @@ async def guruh_handler(message: Message, state: FSMContext):
 
     groups = sorted(
         students_df[
-            (students_df["Ta'lim shakli"] == data["talim"]) &
-            (students_df["Kurs"].astype(str) == data["kurs"])
+            (students_df["Ta'lim shakli"] == data["talim"])
+            & (students_df["Kurs"].astype(str) == data["kurs"])
         ]["Guruh"].unique().tolist()
     )
 
     if value not in groups:
-        await message.answer("Ro'yxatdan birini tanlang.")
+        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
         return
 
     await state.update_data(guruh=value)
 
     names = sorted(
         students_df[
-            (students_df["Ta'lim shakli"] == data["talim"]) &
-            (students_df["Kurs"].astype(str) == data["kurs"]) &
-            (students_df["Guruh"] == value)
+            (students_df["Ta'lim shakli"] == data["talim"])
+            & (students_df["Kurs"].astype(str) == data["kurs"])
+            & (students_df["Guruh"] == value)
         ]["F.I.SH."].unique().tolist()
     )
 
     await state.set_state(Form.fio)
     await message.answer(
-        "F.I.SH. ni tanlang:",
-        reply_markup=make_keyboard(names, row_width=1)
+        "🧑‍🎓 F.I.SH. ni tanlang:",
+        reply_markup=make_keyboard(names, row_width=1),
     )
 
 
@@ -291,174 +432,204 @@ async def fio_handler(message: Message, state: FSMContext):
 
     names = sorted(
         students_df[
-            (students_df["Ta'lim shakli"] == data["talim"]) &
-            (students_df["Kurs"].astype(str) == data["kurs"]) &
-            (students_df["Guruh"] == data["guruh"])
+            (students_df["Ta'lim shakli"] == data["talim"])
+            & (students_df["Kurs"].astype(str) == data["kurs"])
+            & (students_df["Guruh"] == data["guruh"])
         ]["F.I.SH."].unique().tolist()
     )
 
     if value not in names:
-        await message.answer("Ro'yxatdan birini tanlang.")
+        await message.answer("⚠️ Ro'yxatdan birini tanlang.")
+        return
+[15.03.2026 13:27] Safarov Jasur: if student_already_exists(
+        talim=data["talim"],
+        kurs=data["kurs"],
+        guruh=data["guruh"],
+        fio=value,
+    ):
+        await state.clear()
+        await message.answer(
+            "⚠️ Bu talaba uchun ma'lumot allaqachon kiritilgan."
+        )
         return
 
     await state.update_data(fio=value)
 
-    await state.set_state(Form.choose_phone_action)
+    await state.set_state(Form.main_phone)
     await message.answer(
-        "Raqamlarni kiriting.\n"
-        "Avval Asosiy raqamni bosing.",
-        reply_markup=make_keyboard(
-            ["Asosiy raqam", "Qo'shimcha raqam", "Ota-onasining raqami"],
-            row_width=1
-        )
+        "📱 Asosiy raqamni kiriting.\n\n"
+        "Misol: 901234567 yoki +998901234567",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
-@dp.message(Form.choose_phone_action)
-async def choose_phone_action_handler(message: Message, state: FSMContext):
-    action = message.text.strip()
-    data = await state.get_data()
-
-    allowed = ["Asosiy raqam", "Qo'shimcha raqam", "Ota-onasining raqami"]
-    if action not in allowed:
-        await message.answer("Ro'yxatdan birini tanlang.")
-        return
-
-    if action == "Asosiy raqam":
-        await state.set_state(Form.enter_main_phone)
-        await message.answer(
-            "Asosiy raqamni kiriting.\nMasalan: 901234567 yoki +998901234567",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if action == "Qo'shimcha raqam":
-        if not data.get("main_phone"):
-            await message.answer("Avval Asosiy raqamni kiriting.")
-            return
-
-        await state.set_state(Form.enter_extra_phone)
-        await message.answer(
-            "Qo'shimcha raqamni kiriting.\nMasalan: 901234567 yoki +998901234567",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if action == "Ota-onasining raqami":
-        if not data.get("main_phone") or not data.get("extra_phone"):
-            await message.answer("Avval Asosiy va Qo'shimcha raqamni kiriting.")
-            return
-
-        await state.set_state(Form.enter_parent_phone)
-        await message.answer(
-            "Ota-onasining raqamini kiriting.\nKiritmasangiz O'tkazib yuborish ni bosing.",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="O'tkazib yuborish")],
-                    [KeyboardButton(text="Bekor qilish")]
-                ],
-                resize_keyboard=True
-            )
-        )
-
-
-@dp.message(Form.enter_main_phone)
-async def enter_main_phone_handler(message: Message, state: FSMContext):
+@dp.message(Form.main_phone)
+async def main_phone_handler(message: Message, state: FSMContext):
     phone = normalize_phone(message.text)
 
     if not phone:
-        await message.answer("Raqam noto'g'ri. Masalan: 901234567 yoki +998901234567")
+        await message.answer(
+            "❌ Asosiy raqam noto‘g‘ri.\n"
+            "Misol: 901234567 yoki +998901234567"
+        )
         return
 
     await state.update_data(main_phone=phone)
 
-    await state.set_state(Form.choose_phone_action)
+    await state.set_state(Form.extra_phone)
     await message.answer(
-        f"Asosiy raqam saqlandi: {phone}\nEndi Qo'shimcha raqamni kiriting.",
-        reply_markup=make_keyboard(
-            ["Asosiy raqam", "Qo'shimcha raqam", "Ota-onasining raqami"],
-            row_width=1
-        )
+        "📲 Qo'shimcha raqamni kiriting.\n\n"
+        "Misol: 901234567 yoki +998901234567"
     )
 
 
-@dp.message(Form.enter_extra_phone)
-async def enter_extra_phone_handler(message: Message, state: FSMContext):
+@dp.message(Form.extra_phone)
+async def extra_phone_handler(message: Message, state: FSMContext):
     phone = normalize_phone(message.text)
 
     if not phone:
-        await message.answer("Raqam noto'g'ri. Masalan: 901234567 yoki +998901234567")
-        return
-
-    await state.update_data(extra_phone=phone)
-
-    await state.set_state(Form.choose_phone_action)
-    await message.answer(
-        f"Qo'shimcha raqam saqlandi: {phone}\n"
-        "Ota-onasining raqamini kiriting yoki O'tkazib yuborishingiz mumkin.",
-        reply_markup=make_keyboard(
-            ["Asosiy raqam", "Qo'shimcha raqam", "Ota-onasining raqami"],
-            row_width=1
+        await message.answer(
+            "❌ Qo‘shimcha raqam noto‘g‘ri.\n"
+            "Misol: 901234567 yoki +998901234567"
         )
-    )
-
-
-@dp.message(Form.enter_parent_phone, F.text == "O'tkazib yuborish")
-async def skip_parent_phone_handler(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    row_data = {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "telegram_user_id": message.from_user.id,
-        "telegram_username": message.from_user.username or "",
-        "Ta'lim shakli": data["talim"],
-        "Kurs": data["kurs"],
-        "Guruh": data["guruh"],
-        "F.I.SH.": data["fio"],
-        "Asosiy raqam": data["main_phone"],
-        "Qo'shimcha raqam": data["extra_phone"],
-        "Ota-onasining raqami": "",
-    }
-
-    save_result(row_data)
-    await state.clear()
-
-    await message.answer(
-        "Ma'lumot muvaffaqiyatli saqlandi.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
-@dp.message(Form.enter_parent_phone)
-async def enter_parent_phone_handler(message: Message, state: FSMContext):
-    phone = normalize_phone(message.text)
-
-    if not phone:
-        await message.answer("Raqam noto'g'ri. Masalan: 901234567 yoki +998901234567")
         return
 
     data = await state.get_data()
 
     row_data = {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "telegram_user_id": message.from_user.id,
+        "telegram_full_name": message.from_user.full_name,
         "telegram_username": message.from_user.username or "",
         "Ta'lim shakli": data["talim"],
         "Kurs": data["kurs"],
         "Guruh": data["guruh"],
         "F.I.SH.": data["fio"],
         "Asosiy raqam": data["main_phone"],
-        "Qo'shimcha raqam": data["extra_phone"],
-        "Ota-onasining raqami": phone,
+        "Qo'shimcha raqam": phone,
     }
 
     save_result(row_data)
     await state.clear()
 
     await message.answer(
-        "Ma'lumot muvaffaqiyatli saqlandi.",
-        reply_markup=ReplyKeyboardRemove()
+        "✅ Ma'lumotlaringiz muvaffaqiyatli saqlandi!\n\n"
+        "📄 Ko‘rish: /myinfo\n"
+        "✏️ Tahrirlash: /edit"
     )
+
+
+# =========================
+# TAHRIRLASH
+# =========================
+@dp.message(EditForm.main_phone)
+async def edit_main_phone_handler(message: Message, state: FSMContext):
+    phone = normalize_phone(message.text)
+
+    if not phone:
+        await message.answer(
+            "❌ Asosiy raqam noto‘g‘ri.\n"
+            "Misol: 901234567 yoki +998901234567"
+        )
+        return
+
+    await state.update_data(main_phone=phone)
+    await state.set_state(EditForm.extra_phone)
+
+    await message.answer(
+        "📲 Yangi qo‘shimcha raqamni kiriting:\n"
+        "Misol: 901234567 yoki +998901234567"
+    )
+
+
+@dp.message(EditForm.extra_phone)
+async def edit_extra_phone_handler(message: Message, state: FSMContext):
+    phone = normalize_phone(message.text)
+
+    if not phone:
+        await message.answer(
+            "❌ Qo‘shimcha raqam noto‘g‘ri.\n"
+            "Misol: 901234567 yoki +998901234567"
+        )
+        return
+
+    data = await state.get_data()
+    ok = update_user_phones(
+        telegram_user_id=message.from_user.id,
+        main_phone=data["main_phone"],
+        extra_phone=phone,
+    )
+
+    await state.clear()
+
+    if ok:
+        await message.answer(
+            "✅ Raqamlar muvaffaqiyatli yangilandi!\n\n"
+            "📄 Ko‘rish: /myinfo"
+        )
+    else:
+        await message.answer("❌ Tahrirlashda xatolik bo‘ldi.")
+
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+@dp.message(Command("stat"))
+async def stat_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Sizda bu buyruq uchun ruxsat yo'q.")
+        return
+
+    records = get_all_records()
+    total = len(records)
+
+    if total == 0:
+        await message.answer("📊 Hozircha ma'lumot yo'q.")
+        return
+
+    df = pd.DataFrame(records)
+[15.03.2026 13:27] Safarov Jasur: talim_stats = df["Ta'lim shakli"].value_counts().to_dict() if "Ta'lim shakli" in df else {}
+    kurs_stats = df["Kurs"].value_counts().to_dict() if "Kurs" in df else {}
+
+    text = [f"📊 Jami topshirilganlar: {total}\n"]
+
+    text.append("🎓 Ta'lim shakli bo'yicha:")
+    for k, v in talim_stats.items():
+        text.append(f"• {k}: {v}")
+
+    text.append("\n📚 Kurs bo'yicha:")
+    for k, v in kurs_stats.items():
+        text.append(f"• {k}: {v}")
+
+    await message.answer("\n".join(text))
+
+
+@dp.message(Command("excel"))
+async def excel_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Sizda bu buyruq uchun ruxsat yo'q.")
+        return
+
+    records = get_all_records()
+    if not records:
+        await message.answer("📄 Eksport qilish uchun ma'lumot yo'q.")
+        return
+
+    df = pd.DataFrame(records)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Telefonlar", index=False)
+
+    output.seek(0)
+
+    file = BufferedInputFile(
+        output.read(),
+        filename=f"telefonlar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+    )
+
+    await message.answer_document(file, caption="📥 Excel eksport tayyor")
 
 
 async def main():
@@ -466,5 +637,5 @@ async def main():
     await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
+if name == "main":
     asyncio.run(main())
