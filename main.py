@@ -1,4 +1,4 @@
-[15.03.2026 13:27] Safarov Jasur: import asyncio
+
 import json
 import logging
 import os
