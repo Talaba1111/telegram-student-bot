@@ -1,4 +1,4 @@
-
+import asyncio
 import json
 import logging
 import os
@@ -155,7 +155,8 @@ def ensure_sheet_header():
         "Asosiy raqam",
         "Qo'shimcha raqam",
     ]
-[15.03.2026 13:27] Safarov Jasur: if not values:
+
+    if not values:
         ws.append_row(header)
 
 
@@ -306,7 +307,8 @@ async def myinfo_handler(message: Message):
     if not row:
         await message.answer("ℹ️ Siz hali ma'lumot yubormagansiz. /start bosing.")
         return
-[15.03.2026 13:27] Safarov Jasur: text = (
+
+    text = (
         "📄 Sizning saqlangan ma'lumotlaringiz:\n\n"
         f"🎓 Ta'lim shakli: {row.get(\"Ta'lim shakli\", '')}\n"
         f"📚 Kurs: {row.get('Kurs', '')}\n"
@@ -441,7 +443,8 @@ async def fio_handler(message: Message, state: FSMContext):
     if value not in names:
         await message.answer("⚠️ Ro'yxatdan birini tanlang.")
         return
-[15.03.2026 13:27] Safarov Jasur: if student_already_exists(
+
+    if student_already_exists(
         talim=data["talim"],
         kurs=data["kurs"],
         guruh=data["guruh"],
@@ -589,7 +592,8 @@ async def stat_handler(message: Message):
         return
 
     df = pd.DataFrame(records)
-[15.03.2026 13:27] Safarov Jasur: talim_stats = df["Ta'lim shakli"].value_counts().to_dict() if "Ta'lim shakli" in df else {}
+
+    talim_stats = df["Ta'lim shakli"].value_counts().to_dict() if "Ta'lim shakli" in df else {}
     kurs_stats = df["Kurs"].value_counts().to_dict() if "Kurs" in df else {}
 
     text = [f"📊 Jami topshirilganlar: {total}\n"]
@@ -637,5 +641,5 @@ async def main():
     await dp.start_polling(bot)
 
 
-if name == "main":
+if __name__ == "__main__":
     asyncio.run(main())
