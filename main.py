@@ -528,7 +528,9 @@ async def edit_phone2_handler(message: Message, state: FSMContext):
     await state.clear()
 
     if ok:
-        await message.answer("✅ Raqamlar muvaffaqiyatli yangilandi!\n\n📄 Ko‘rish: /myinfo")
+        await message.answer(
+            "✅ Raqamlar muvaffaqiyatli yangilandi!\n\n📄 Ko‘rish: /myinfo"
+        )
     else:
         await message.answer("❌ Tahrirlashda xatolik bo‘ldi.")
 
