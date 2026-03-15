@@ -301,7 +301,7 @@ async def myinfo_handler(message: Message):
 
     text = (
         "📄 Sizning ma'lumotlaringiz:\n\n"
-        f"🎓 Ta'lim shakli: {row.get('Ta'lim shakli', '')}\n"
+      f"🎓 Ta'lim shakli: {row.get(\"Ta'lim shakli\", '')}\n"
         f"📚 Kurs: {row.get('Kurs', '')}\n"
         f"👥 Guruh: {row.get('Guruh', '')}\n"
         f"🧑‍🎓 F.I.SH.: {row.get('F.I.SH.', '')}\n"
