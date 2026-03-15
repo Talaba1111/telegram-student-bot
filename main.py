@@ -1,10 +1,13 @@
 import asyncio
+import json
 import logging
 import os
 import re
 from datetime import datetime
 
 import pandas as pd
+import gspread
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -15,11 +18,20 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKey
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "").strip()
+GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi")
 
+if not GOOGLE_SHEET_NAME:
+    raise ValueError("GOOGLE_SHEET_NAME topilmadi")
+
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON topilmadi")
+
 INPUT_FILE = "students.xlsx"
-OUTPUT_FILE = "natijalar.xlsx"
 
 
 def load_students():
@@ -29,7 +41,6 @@ def load_students():
     df = pd.read_excel(INPUT_FILE)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Excel ustunlari
     required_cols = ["Ta'lim shakli", "Kurs", "Guruh", "F.I.SH."]
     for col in required_cols:
         if col not in df.columns:
@@ -40,38 +51,69 @@ def load_students():
     for col in required_cols:
         df[col] = df[col].astype(str).str.strip()
 
+    # bo'sh satrlarni olib tashlash
+    df = df[
+        (df["Ta'lim shakli"] != "") &
+        (df["Kurs"] != "") &
+        (df["Guruh"] != "") &
+        (df["F.I.SH."] != "")
+    ].copy()
+
     return df
 
 
-def ensure_output_file():
-    if not os.path.exists(OUTPUT_FILE):
-        df = pd.DataFrame(columns=[
-            "Sana",
-            "Telegram ID",
-            "Telegram username",
-            "Ta'lim shakli",
-            "Kurs",
-            "Guruh",
-            "F.I.SH.",
-            "Asosiy raqam",
-            "Qo'shimcha raqam",
-            "Ota-onasining raqami",
-        ])
-        df.to_excel(OUTPUT_FILE, index=False)
+def get_gspread_client():
+    creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    return gspread.service_account_from_dict(creds)
 
 
-def save_result(row_data: dict):
-    ensure_output_file()
-    old_df = pd.read_excel(OUTPUT_FILE)
-    new_df = pd.concat([old_df, pd.DataFrame([row_data])], ignore_index=True)
-    new_df.to_excel(OUTPUT_FILE, index=False)
+def get_worksheet():
+    gc = get_gspread_client()
+    sh = gc.open(GOOGLE_SHEET_NAME)
+    ws = sh.worksheet(GOOGLE_WORKSHEET_NAME)
+    return ws
+
+
+def ensure_sheet_header():
+    ws = get_worksheet()
+    values = ws.get_all_values()
+
+    header = [
+        "created_at",
+        "telegram_user_id",
+        "telegram_username",
+        "Ta'lim shakli",
+        "Kurs",
+        "Guruh",
+        "F.I.SH.",
+        "Asosiy raqam",
+        "Qo'shimcha raqam",
+        "Ota-onasining raqami",
+    ]
+
+    if not values:
+        ws.append_row(header)
+
+
+def save_result(data: dict):
+    ws = get_worksheet()
+    ws.append_row([
+        data["created_at"],
+        data["telegram_user_id"],
+        data["telegram_username"],
+        data["Ta'lim shakli"],
+        data["Kurs"],
+        data["Guruh"],
+        data["F.I.SH."],
+        data["Asosiy raqam"],
+        data["Qo'shimcha raqam"],
+        data["Ota-onasining raqami"],
+    ])
 
 
 def normalize_phone(phone_text: str):
     """
-    9 xonali raqam yozsa avtomatik +998 qo'shiladi.
-    Masalan:
-    901234567 -> +998901234567
+    9 xonali raqam kiritilsa avtomatik +998 qo'shiladi.
     """
     phone = phone_text.strip()
     phone = re.sub(r"[^\d+]", "", phone)
@@ -132,6 +174,12 @@ async def start_handler(message: Message, state: FSMContext):
     await state.clear()
 
     talim_list = sorted(students_df["Ta'lim shakli"].unique().tolist())
+
+    if not talim_list:
+        await message.answer(
+            "Talabalar ro'yxati hali kiritilmagan. Administrator students.xlsx faylni to'ldirishi kerak."
+        )
+        return
 
     await state.set_state(Form.talim)
     await message.answer(
@@ -360,9 +408,9 @@ async def skip_parent_phone_handler(message: Message, state: FSMContext):
     data = await state.get_data()
 
     row_data = {
-        "Sana": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Telegram ID": message.from_user.id,
-        "Telegram username": message.from_user.username or "",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "telegram_user_id": message.from_user.id,
+        "telegram_username": message.from_user.username or "",
         "Ta'lim shakli": data["talim"],
         "Kurs": data["kurs"],
         "Guruh": data["guruh"],
@@ -392,9 +440,9 @@ async def enter_parent_phone_handler(message: Message, state: FSMContext):
     data = await state.get_data()
 
     row_data = {
-        "Sana": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Telegram ID": message.from_user.id,
-        "Telegram username": message.from_user.username or "",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "telegram_user_id": message.from_user.id,
+        "telegram_username": message.from_user.username or "",
         "Ta'lim shakli": data["talim"],
         "Kurs": data["kurs"],
         "Guruh": data["guruh"],
@@ -414,6 +462,7 @@ async def enter_parent_phone_handler(message: Message, state: FSMContext):
 
 
 async def main():
+    ensure_sheet_header()
     await dp.start_polling(bot)
 
 
