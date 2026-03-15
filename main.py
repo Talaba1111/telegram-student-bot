@@ -1,5 +1,4 @@
 import asyncio
-import html
 import json
 import logging
 import os
@@ -44,7 +43,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 user_locks = defaultdict(asyncio.Lock)
@@ -55,12 +54,11 @@ class RegisterStates(StatesGroup):
     choosing_course = State()
     choosing_group = State()
     choosing_student = State()
+    confirm_edit = State()
     waiting_main_phone = State()
     waiting_extra_phone = State()
     confirm_save = State()
-    confirm_edit = State()
     admin_search = State()
-    admin_search_by_id = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -69,10 +67,6 @@ def is_admin(user_id: int) -> bool:
 
 def normalize_text(value) -> str:
     return str(value).strip() if value is not None else ""
-
-
-def safe_html(text: str) -> str:
-    return html.escape(normalize_text(text))
 
 
 def normalize_header(text: str) -> str:
@@ -98,12 +92,12 @@ def is_valid_uz_phone(phone: str) -> bool:
     return bool(re.fullmatch(r"^\+998\d{9}$", phone))
 
 
-def unique_sorted(values: List[str]) -> List[str]:
+def unique_values(values: List[str]) -> List[str]:
     result = []
     for value in values:
-        value = normalize_text(value)
-        if value and value not in result:
-            result.append(value)
+        v = normalize_text(value)
+        if v and v not in result:
+            result.append(v)
     return result
 
 
@@ -125,17 +119,6 @@ def make_keyboard(items: List[str], per_row: int = 2, add_cancel: bool = True) -
 
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-
-def contact_keyboard(label: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=label, request_contact=True)],
-            [KeyboardButton(text="❌ Bekor qilish")]
-        ],
         resize_keyboard=True,
         one_time_keyboard=True
     )
@@ -169,9 +152,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="🔄 Yangilash")],
-            [KeyboardButton(text="🔎 Qidiruv"), KeyboardButton(text="🆔 ID bo'yicha qidiruv")],
-            [KeyboardButton(text="🕒 Oxirgi yangilanishlar"), KeyboardButton(text="📋 Ustunlar")],
-            [KeyboardButton(text="🧾 Loglar"), KeyboardButton(text="🏠 Chiqish")]
+            [KeyboardButton(text="🔎 Qidiruv")],
+            [KeyboardButton(text="🏠 Chiqish")]
         ],
         resize_keyboard=True,
         one_time_keyboard=True
@@ -283,13 +265,13 @@ async def get_required_columns(worksheet) -> Dict[str, str]:
     )
 
     if not education_col:
-        raise ValueError("Google Sheetsda <b>Ta'lim shakli</b> ustuni topilmadi")
+        raise ValueError("Google Sheetsda Ta'lim shakli ustuni topilmadi")
     if not course_col:
-        raise ValueError("Google Sheetsda <b>Kurs</b> ustuni topilmadi")
+        raise ValueError("Google Sheetsda Kurs ustuni topilmadi")
     if not group_col:
-        raise ValueError("Google Sheetsda <b>Guruh</b> ustuni topilmadi")
+        raise ValueError("Google Sheetsda Guruh ustuni topilmadi")
     if not student_col:
-        raise ValueError("Google Sheetsda <b>F.I.SH.</b> ustuni topilmadi")
+        raise ValueError("Google Sheetsda F.I.SH. ustuni topilmadi")
 
     return {
         "education": education_col,
@@ -299,31 +281,40 @@ async def get_required_columns(worksheet) -> Dict[str, str]:
     }
 
 
-async def get_educations() -> List[str]:
+async def fetch_sheet_snapshot() -> Dict:
     worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-    columns = await get_required_columns(worksheet)
-    return unique_sorted([normalize_text(r.get(columns["education"], "")) for r in records])
-
-
-async def get_courses(education: str) -> List[str]:
-    worksheet = await get_worksheet()
+    await ensure_extra_columns(worksheet)
     records = await get_all_records(worksheet)
     columns = await get_required_columns(worksheet)
 
-    return unique_sorted([
+    return {
+        "records": records,
+        "columns": columns,
+    }
+
+
+def get_educations_from_snapshot(snapshot: Dict) -> List[str]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
+    return unique_values([normalize_text(r.get(columns["education"], "")) for r in records])
+
+
+def get_courses_from_snapshot(snapshot: Dict, education: str) -> List[str]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
+
+    return unique_values([
         normalize_text(r.get(columns["course"], ""))
         for r in records
         if normalize_text(r.get(columns["education"], "")) == education
     ])
 
 
-async def get_groups(education: str, course: str) -> List[str]:
-    worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-    columns = await get_required_columns(worksheet)
+def get_groups_from_snapshot(snapshot: Dict, education: str, course: str) -> List[str]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
 
-    return unique_sorted([
+    return unique_values([
         normalize_text(r.get(columns["group"], ""))
         for r in records
         if normalize_text(r.get(columns["education"], "")) == education
@@ -331,18 +322,41 @@ async def get_groups(education: str, course: str) -> List[str]:
     ])
 
 
-async def get_students(education: str, course: str, group: str) -> List[str]:
-    worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-    columns = await get_required_columns(worksheet)
+def get_students_from_snapshot(snapshot: Dict, education: str, course: str, group: str) -> List[str]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
 
-    return unique_sorted([
+    return unique_values([
         normalize_text(r.get(columns["student"], ""))
         for r in records
         if normalize_text(r.get(columns["education"], "")) == education
         and normalize_text(r.get(columns["course"], "")) == course
         and normalize_text(r.get(columns["group"], "")) == group
     ])
+
+
+def get_saved_data_from_snapshot(snapshot: Dict, student: str, course: str, group: str, education: str) -> Dict[str, str]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
+
+    for row in records:
+        if (
+            normalize_text(row.get(columns["student"], "")) == student
+            and normalize_text(row.get(columns["course"], "")) == course
+            and normalize_text(row.get(columns["group"], "")) == group
+            and normalize_text(row.get(columns["education"], "")) == education
+        ):
+            return {
+                "main_phone": normalize_text(row.get("Asosiy nomer", "")),
+                "extra_phone": normalize_text(row.get("Qo'shimcha nomer", "")),
+                "telegram_id": normalize_text(row.get("Telegram ID", "")),
+            }
+
+    return {
+        "main_phone": "",
+        "extra_phone": "",
+        "telegram_id": "",
+    }
 
 
 async def find_student_row_index(
@@ -364,42 +378,6 @@ async def find_student_row_index(
         ):
             return row_index
     return None
-
-
-async def get_student_saved_data(
-    student: str,
-    course: str,
-    group: str,
-    education: str,
-) -> Dict[str, str]:
-    worksheet = await get_worksheet()
-    await ensure_extra_columns(worksheet)
-    row_index = await find_student_row_index(worksheet, student, course, group, education)
-
-    if not row_index:
-        raise ValueError("Talaba topilmadi")
-
-    main_col = await get_col_index_by_name(worksheet, "Asosiy nomer")
-    extra_col = await get_col_index_by_name(worksheet, "Qo'shimcha nomer")
-    tg_id_col = await get_col_index_by_name(worksheet, "Telegram ID")
-
-    main_phone = ""
-    extra_phone = ""
-    tg_id = ""
-
-    if main_col:
-        main_phone = normalize_text((await asyncio.to_thread(worksheet.cell, row_index, main_col)).value)
-    if extra_col:
-        extra_phone = normalize_text((await asyncio.to_thread(worksheet.cell, row_index, extra_col)).value)
-    if tg_id_col:
-        tg_id = normalize_text((await asyncio.to_thread(worksheet.cell, row_index, tg_id_col)).value)
-
-    return {
-        "main_phone": main_phone,
-        "extra_phone": extra_phone,
-        "telegram_id": tg_id,
-        "row_index": str(row_index),
-    }
 
 
 async def save_full_data_to_sheet(
@@ -472,9 +450,9 @@ async def save_full_data_to_sheet(
 
 
 async def get_sheet_stats() -> Tuple[int, int, int]:
-    worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-    columns = await get_required_columns(worksheet)
+    snapshot = await fetch_sheet_snapshot()
+    records = snapshot["records"]
+    columns = snapshot["columns"]
 
     total_students = len(records)
     total_groups = len(set(
@@ -491,9 +469,9 @@ async def get_sheet_stats() -> Tuple[int, int, int]:
 
 
 async def search_students(keyword: str) -> List[dict]:
-    worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-    columns = await get_required_columns(worksheet)
+    snapshot = await fetch_sheet_snapshot()
+    records = snapshot["records"]
+    columns = snapshot["columns"]
 
     keyword = normalize_text(keyword).lower()
     found = []
@@ -519,47 +497,19 @@ async def search_students(keyword: str) -> List[dict]:
     return found[:10]
 
 
-async def get_recent_updates(limit: int = 10) -> List[dict]:
-    worksheet = await get_worksheet()
-    records = await get_all_records(worksheet)
-
-    result = []
-    for row in records:
-        updated = normalize_text(row.get("Oxirgi yangilanish", ""))
-        if updated:
-            student_value = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
-            group_value = normalize_text(row.get("Guruh", ""))
-            tg_id_value = normalize_text(row.get("Telegram ID", ""))
-
-            result.append({
-                "student": student_value,
-                "group": group_value,
-                "updated": updated,
-                "telegram_id": tg_id_value,
-            })
-
-    result.sort(key=lambda x: x["updated"], reverse=True)
-    return result[:limit]
-
-
-async def cancel_flow(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ <b>Amal bekor qilindi</b>\nQayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
 async def show_education_step(message: Message, state: FSMContext):
-    educations = await get_educations()
+    snapshot = await fetch_sheet_snapshot()
+    educations = get_educations_from_snapshot(snapshot)
 
     if not educations:
-        await message.answer("⚠️ <b>Ta'lim shakllari topilmadi</b>")
+        await message.answer("⚠️ Ta'lim shakllari topilmadi")
         return
 
     await state.clear()
+    await state.update_data(sheet_snapshot=snapshot)
+
     await message.answer(
-        "🎓 <b>Ta'lim shaklini tanlang:</b>",
+        "🎓 Ta'lim shaklini tanlang:",
         reply_markup=make_keyboard(educations, per_row=2)
     )
     await state.set_state(RegisterStates.choosing_education)
@@ -568,25 +518,26 @@ async def show_education_step(message: Message, state: FSMContext):
 async def show_confirm_step(message: Message, state: FSMContext):
     data = await state.get_data()
 
-    education_value = safe_html(data.get("education", ""))
-    course_value = safe_html(data.get("course", ""))
-    group_value = safe_html(data.get("group", ""))
-    student_value = safe_html(data.get("student", ""))
-    main_phone_value = safe_html(data.get("main_phone", ""))
-    extra_phone_value = safe_html(data.get("extra_phone", ""))
-
     await message.answer(
-        "📝 <b>Kiritilgan ma'lumotlarni tekshiring:</b>\n\n"
-        f"🎓 Ta'lim shakli: <b>{education_value}</b>\n"
-        f"📚 Kurs: <b>{course_value}</b>\n"
-        f"👥 Guruh: <b>{group_value}</b>\n"
-        f"🧑‍🎓 Talaba: <b>{student_value}</b>\n"
-        f"📱 Asosiy raqam: <b>{main_phone_value}</b>\n"
-        f"☎️ Qo'shimcha raqam: <b>{extra_phone_value}</b>\n\n"
+        "📝 Kiritilgan ma'lumotlarni tekshiring:\n\n"
+        f"🎓 Ta'lim shakli: {data.get('education', '')}\n"
+        f"📚 Kurs: {data.get('course', '')}\n"
+        f"👥 Guruh: {data.get('group', '')}\n"
+        f"🧑‍🎓 Talaba: {data.get('student', '')}\n"
+        f"📱 Asosiy raqam: {data.get('main_phone', '')}\n"
+        f"☎️ Qo'shimcha raqam: {data.get('extra_phone', '')}\n\n"
         "✅ Tasdiqlaysizmi yoki ✏️ qayta kiritasizmi?",
         reply_markup=confirm_keyboard()
     )
     await state.set_state(RegisterStates.confirm_save)
+
+
+async def cancel_flow(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "❌ Amal bekor qilindi.\nQayta boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
 
 @dp.message(CommandStart())
@@ -598,10 +549,9 @@ async def start_handler(message: Message, state: FSMContext):
 
         subscribed = await check_subscription(message.from_user.id)
         if not subscribed:
-            channel_value = safe_html(REQUIRED_CHANNEL)
             await message.answer(
-                "📢 <b>Botdan foydalanish uchun avval kanalga obuna bo‘ling.</b>\n\n"
-                f"🔗 Kanal: <b>{channel_value}</b>\n\n"
+                "📢 Botdan foydalanish uchun avval kanalga obuna bo‘ling.\n\n"
+                f"🔗 Kanal: {REQUIRED_CHANNEL}\n\n"
                 "✅ Obuna bo‘lgach, qayta /start bosing."
             )
             return
@@ -610,22 +560,22 @@ async def start_handler(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.exception("start_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(Command("help"))
 async def help_handler(message: Message):
     await message.answer(
-        "ℹ️ <b>Foydalanish tartibi</b>\n\n"
+        "ℹ️ Foydalanish tartibi:\n\n"
         "1. /start bosing\n"
         "2. 🎓 Ta'lim shaklini tanlang\n"
         "3. 📚 Kursni tanlang\n"
         "4. 👥 Guruhni tanlang\n"
         "5. 🧑‍🎓 Talabani tanlang\n"
-        "6. 📱 Asosiy raqamni kiriting\n"
-        "7. ☎️ Qo'shimcha raqamni kiriting\n"
+        "6. 📱 Asosiy raqamni yozing\n"
+        "7. ☎️ Qo'shimcha raqamni yozing\n"
         "8. ✅ Tasdiqlang\n\n"
-        "Telefon raqamlar faqat <b>+998XXXXXXXXX</b> formatida qabul qilinadi."
+        "Telefon raqamlar faqat +998XXXXXXXXX formatida qabul qilinadi."
     )
 
 
@@ -635,7 +585,7 @@ async def my_id_handler(message: Message):
         await message.answer("❌ ID aniqlanmadi.")
         return
 
-    await message.answer(f"🆔 <b>Sizning Telegram ID:</b> <code>{message.from_user.id}</code>")
+    await message.answer(f"🆔 Sizning Telegram ID: {message.from_user.id}")
 
 
 @dp.message(Command("ping"))
@@ -651,134 +601,158 @@ async def cancel_handler(message: Message, state: FSMContext):
 @dp.message(RegisterStates.choosing_education, F.text)
 async def education_handler(message: Message, state: FSMContext):
     try:
+        data = await state.get_data()
+        snapshot = data.get("sheet_snapshot")
+
+        if not snapshot:
+            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
+            await state.clear()
+            return
+
         education = normalize_text(message.text)
-        educations = await get_educations()
+        educations = get_educations_from_snapshot(snapshot)
 
         if education not in educations:
             await message.answer("⚠️ Iltimos, tugmalardan birini tanlang.")
             return
 
-        courses = await get_courses(education)
+        courses = get_courses_from_snapshot(snapshot, education)
         if not courses:
             await message.answer("⚠️ Bu ta'lim shakli uchun kurs topilmadi.")
             return
 
         await state.update_data(education=education)
         await message.answer(
-            "📚 <b>Kursni tanlang:</b>",
+            "📚 Kursni tanlang:",
             reply_markup=make_keyboard(courses, per_row=3)
         )
         await state.set_state(RegisterStates.choosing_course)
 
     except Exception as e:
         logging.exception("education_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.choosing_course, F.text)
 async def course_handler(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
+        snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
-        course = normalize_text(message.text)
 
-        courses = await get_courses(education)
+        if not snapshot:
+            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
+            await state.clear()
+            return
+
+        course = normalize_text(message.text)
+        courses = get_courses_from_snapshot(snapshot, education)
+
         if course not in courses:
             await message.answer("⚠️ Iltimos, kursni tugmalardan tanlang.")
             return
 
-        groups = await get_groups(education, course)
+        groups = get_groups_from_snapshot(snapshot, education, course)
         if not groups:
             await message.answer("⚠️ Bu kurs uchun guruh topilmadi.")
             return
 
         await state.update_data(course=course)
         await message.answer(
-            "👥 <b>Guruhni tanlang:</b>",
+            "👥 Guruhni tanlang:",
             reply_markup=make_keyboard(groups, per_row=2)
         )
         await state.set_state(RegisterStates.choosing_group)
 
     except Exception as e:
         logging.exception("course_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.choosing_group, F.text)
 async def group_handler(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
+        snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
         course = data.get("course", "")
-        group = normalize_text(message.text)
 
-        groups = await get_groups(education, course)
+        if not snapshot:
+            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
+            await state.clear()
+            return
+
+        group = normalize_text(message.text)
+        groups = get_groups_from_snapshot(snapshot, education, course)
+
         if group not in groups:
             await message.answer("⚠️ Iltimos, guruhni tugmalardan tanlang.")
             return
 
-        students = await get_students(education, course, group)
+        students = get_students_from_snapshot(snapshot, education, course, group)
         if not students:
             await message.answer("⚠️ Bu guruhda talabalar topilmadi.")
             return
 
         await state.update_data(group=group)
         await message.answer(
-            "🧑‍🎓 <b>Talabani tanlang:</b>",
+            "🧑‍🎓 Talabani tanlang:",
             reply_markup=make_keyboard(students, per_row=1)
         )
         await state.set_state(RegisterStates.choosing_student)
 
     except Exception as e:
         logging.exception("group_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.choosing_student, F.text)
 async def student_handler(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
+        snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
         course = data.get("course", "")
         group = data.get("group", "")
-        student = normalize_text(message.text)
 
-        students = await get_students(education, course, group)
+        if not snapshot:
+            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
+            await state.clear()
+            return
+
+        student = normalize_text(message.text)
+        students = get_students_from_snapshot(snapshot, education, course, group)
+
         if student not in students:
             await message.answer("⚠️ Iltimos, talabani tugmalardan tanlang.")
             return
 
-        saved = await get_student_saved_data(student, course, group, education)
-
+        saved = get_saved_data_from_snapshot(snapshot, student, course, group, education)
         await state.update_data(student=student)
 
         if saved["telegram_id"] and message.from_user and saved["telegram_id"] == str(message.from_user.id):
             if saved["main_phone"] or saved["extra_phone"]:
-                main_value = safe_html(saved["main_phone"] or "-")
-                extra_value = safe_html(saved["extra_phone"] or "-")
-
                 await message.answer(
-                    "ℹ️ <b>Bu talaba uchun oldin ma'lumot saqlangan.</b>\n\n"
-                    f"📱 Asosiy raqam: <b>{main_value}</b>\n"
-                    f"☎️ Qo'shimcha raqam: <b>{extra_value}</b>\n\n"
+                    "ℹ️ Bu talaba uchun oldin ma'lumot saqlangan.\n\n"
+                    f"📱 Asosiy raqam: {saved['main_phone'] or '-'}\n"
+                    f"☎️ Qo'shimcha raqam: {saved['extra_phone'] or '-'}\n\n"
                     "Qaysi qismini o'zgartirmoqchisiz?",
                     reply_markup=edit_choice_keyboard()
                 )
                 await state.set_state(RegisterStates.confirm_edit)
                 return
 
-        student_value = safe_html(student)
         await message.answer(
-            f"✅ <b>Tanlangan talaba:</b> {student_value}\n\n"
-            "📱 <b>Endi ASOSIY raqamni yuboring</b>\n"
-            "Format: <b>+998XXXXXXXXX</b>",
-            reply_markup=contact_keyboard("📲 Asosiy raqamni kontakt qilib yuborish")
+            f"✅ Tanlangan talaba: {student}\n\n"
+            "📱 Endi ASOSIY raqamni yozing\n"
+            "Format: +998XXXXXXXXX",
+            reply_markup=make_keyboard([], add_cancel=True)
         )
         await state.set_state(RegisterStates.waiting_main_phone)
 
     except Exception as e:
         logging.exception("student_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.confirm_edit, F.text)
@@ -788,16 +762,16 @@ async def confirm_edit_handler(message: Message, state: FSMContext):
 
         if text == "📱 Asosiy raqamni o'zgartirish":
             await message.answer(
-                "📱 <b>Yangi ASOSIY raqamni yuboring</b>\nFormat: <b>+998XXXXXXXXX</b>",
-                reply_markup=contact_keyboard("📲 Asosiy raqamni kontakt qilib yuborish")
+                "📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX",
+                reply_markup=make_keyboard([], add_cancel=True)
             )
             await state.set_state(RegisterStates.waiting_main_phone)
             return
 
         if text == "☎️ Qo'shimcha raqamni o'zgartirish":
             await message.answer(
-                "☎️ <b>Yangi QO'SHIMCHA raqamni yuboring</b>\nFormat: <b>+998XXXXXXXXX</b>",
-                reply_markup=contact_keyboard("📲 Qo'shimcha raqamni kontakt qilib yuborish")
+                "☎️ Yangi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX",
+                reply_markup=make_keyboard([], add_cancel=True)
             )
             await state.set_state(RegisterStates.waiting_extra_phone)
             return
@@ -805,8 +779,8 @@ async def confirm_edit_handler(message: Message, state: FSMContext):
         if text == "🔁 Ikkalasini qayta kiritish":
             await state.update_data(main_phone="", extra_phone="")
             await message.answer(
-                "📱 <b>Yangi ASOSIY raqamni yuboring</b>\nFormat: <b>+998XXXXXXXXX</b>",
-                reply_markup=contact_keyboard("📲 Asosiy raqamni kontakt qilib yuborish")
+                "📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX",
+                reply_markup=make_keyboard([], add_cancel=True)
             )
             await state.set_state(RegisterStates.waiting_main_phone)
             return
@@ -815,36 +789,7 @@ async def confirm_edit_handler(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.exception("confirm_edit_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(RegisterStates.waiting_main_phone, F.contact)
-async def main_phone_contact_handler(message: Message, state: FSMContext):
-    try:
-        if not message.from_user or not message.contact:
-            await message.answer("⚠️ Kontakt topilmadi.")
-            return
-
-        if message.contact.user_id and message.contact.user_id != message.from_user.id:
-            await message.answer("⚠️ Faqat o'zingizning telefon raqamingizni yuboring.")
-            return
-
-        phone = normalize_phone(message.contact.phone_number)
-        if not is_valid_uz_phone(phone):
-            await message.answer("⚠️ Asosiy raqam noto'g'ri. Faqat <b>+998XXXXXXXXX</b> format.")
-            return
-
-        await state.update_data(main_phone=phone)
-
-        await message.answer(
-            "☎️ <b>Endi QO'SHIMCHA raqamni yuboring</b>\nFormat: <b>+998XXXXXXXXX</b>",
-            reply_markup=contact_keyboard("📲 Qo'shimcha raqamni kontakt qilib yuborish")
-        )
-        await state.set_state(RegisterStates.waiting_extra_phone)
-
-    except Exception as e:
-        logging.exception("main_phone_contact_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.waiting_main_phone, F.text)
@@ -858,56 +803,20 @@ async def main_phone_text_handler(message: Message, state: FSMContext):
 
         phone = normalize_phone(text)
         if not is_valid_uz_phone(phone):
-            await message.answer("⚠️ Asosiy raqam noto'g'ri. Masalan: <b>+998901234567</b>")
+            await message.answer("⚠️ Asosiy raqam noto'g'ri. Masalan: +998901234567")
             return
 
         await state.update_data(main_phone=phone)
 
         await message.answer(
-            "☎️ <b>Endi QO'SHIMCHA raqamni yuboring</b>\nFormat: <b>+998XXXXXXXXX</b>",
-            reply_markup=contact_keyboard("📲 Qo'shimcha raqamni kontakt qilib yuborish")
+            "☎️ Endi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX",
+            reply_markup=make_keyboard([], add_cancel=True)
         )
         await state.set_state(RegisterStates.waiting_extra_phone)
 
     except Exception as e:
         logging.exception("main_phone_text_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(RegisterStates.waiting_extra_phone, F.contact)
-async def extra_phone_contact_handler(message: Message, state: FSMContext):
-    try:
-        if not message.from_user or not message.contact:
-            await message.answer("⚠️ Kontakt topilmadi.")
-            return
-
-        if message.contact.user_id and message.contact.user_id != message.from_user.id:
-            await message.answer("⚠️ Faqat o'zingizning telefon raqamingizni yuboring.")
-            return
-
-        extra_phone = normalize_phone(message.contact.phone_number)
-        if not is_valid_uz_phone(extra_phone):
-            await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Faqat <b>+998XXXXXXXXX</b> format.")
-            return
-
-        data = await state.get_data()
-        main_phone = data.get("main_phone", "")
-
-        if not main_phone:
-            await message.answer("⚠️ Asosiy raqam topilmadi. Qaytadan /start bosing.")
-            await state.clear()
-            return
-
-        if extra_phone == main_phone:
-            await message.answer("⚠️ Qo'shimcha raqam asosiy raqam bilan bir xil bo'lmasin.")
-            return
-
-        await state.update_data(extra_phone=extra_phone)
-        await show_confirm_step(message, state)
-
-    except Exception as e:
-        logging.exception("extra_phone_contact_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.waiting_extra_phone, F.text)
@@ -921,7 +830,7 @@ async def extra_phone_text_handler(message: Message, state: FSMContext):
 
         extra_phone = normalize_phone(text)
         if not is_valid_uz_phone(extra_phone):
-            await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Masalan: <b>+998901234567</b>")
+            await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Masalan: +998901234567")
             return
 
         data = await state.get_data()
@@ -941,7 +850,7 @@ async def extra_phone_text_handler(message: Message, state: FSMContext):
 
     except Exception as e:
         logging.exception("extra_phone_text_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(RegisterStates.confirm_save, F.text)
@@ -952,8 +861,8 @@ async def confirm_save_handler(message: Message, state: FSMContext):
 
         if text == "✏️ Qayta kiritish":
             await message.answer(
-                "📱 <b>Asosiy raqamni qayta kiriting</b>\nFormat: <b>+998XXXXXXXXX</b>",
-                reply_markup=contact_keyboard("📲 Asosiy raqamni kontakt qilib yuborish")
+                "📱 Asosiy raqamni qayta kiriting\nFormat: +998XXXXXXXXX",
+                reply_markup=make_keyboard([], add_cancel=True)
             )
             await state.set_state(RegisterStates.waiting_main_phone)
             return
@@ -981,29 +890,22 @@ async def confirm_save_handler(message: Message, state: FSMContext):
                 telegram_full_name=message.from_user.full_name or "",
             )
 
-        education_value = safe_html(data.get("education", ""))
-        course_value = safe_html(data.get("course", ""))
-        group_value = safe_html(data.get("group", ""))
-        student_value = safe_html(data.get("student", ""))
-        main_phone_value = safe_html(data.get("main_phone", ""))
-        extra_phone_value = safe_html(data.get("extra_phone", ""))
-
         await message.answer(
-            "✅ <b>Ma'lumot muvaffaqiyatli saqlandi</b>\n\n"
-            f"🎓 Ta'lim shakli: <b>{education_value}</b>\n"
-            f"📚 Kurs: <b>{course_value}</b>\n"
-            f"👥 Guruh: <b>{group_value}</b>\n"
-            f"🧑‍🎓 Talaba: <b>{student_value}</b>\n"
-            f"📱 Asosiy raqam: <b>{main_phone_value}</b>\n"
-            f"☎️ Qo'shimcha raqam: <b>{extra_phone_value}</b>\n"
-            f"🆔 Telegram ID: <b>{message.from_user.id}</b>",
+            "✅ Ma'lumot muvaffaqiyatli saqlandi\n\n"
+            f"🎓 Ta'lim shakli: {data.get('education', '')}\n"
+            f"📚 Kurs: {data.get('course', '')}\n"
+            f"👥 Guruh: {data.get('group', '')}\n"
+            f"🧑‍🎓 Talaba: {data.get('student', '')}\n"
+            f"📱 Asosiy raqam: {data.get('main_phone', '')}\n"
+            f"☎️ Qo'shimcha raqam: {data.get('extra_phone', '')}\n"
+            f"🆔 Telegram ID: {message.from_user.id}",
             reply_markup=ReplyKeyboardRemove()
         )
         await state.clear()
 
     except Exception as e:
         logging.exception("confirm_save_handler xatolik: %s", e)
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(Command("admin"))
@@ -1014,7 +916,7 @@ async def admin_handler(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        "🛠 <b>Admin panel</b>\nKerakli bo'limni tanlang:",
+        "🛠 Admin panel\nKerakli bo'limni tanlang:",
         reply_markup=admin_keyboard()
     )
 
@@ -1027,13 +929,13 @@ async def admin_stats_handler(message: Message):
     try:
         total_students, total_groups, total_educations = await get_sheet_stats()
         await message.answer(
-            "📊 <b>Jadval statistikasi</b>\n\n"
-            f"🧑‍🎓 Talabalar soni: <b>{total_students}</b>\n"
-            f"👥 Guruhlar soni: <b>{total_groups}</b>\n"
-            f"🎓 Ta'lim shakllari soni: <b>{total_educations}</b>"
+            "📊 Jadval statistikasi\n\n"
+            f"🧑‍🎓 Talabalar soni: {total_students}\n"
+            f"👥 Guruhlar soni: {total_groups}\n"
+            f"🎓 Ta'lim shakllari soni: {total_educations}"
         )
     except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(F.text == "🔄 Yangilash")
@@ -1042,61 +944,10 @@ async def admin_refresh_handler(message: Message):
         return
 
     try:
-        _ = await get_educations()
+        _ = await fetch_sheet_snapshot()
         await message.answer("✅ Jadval tekshirildi. Yangi talabalar va o'chirilganlar darrov qabul qilinadi.")
     except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(F.text == "📋 Ustunlar")
-async def admin_columns_handler(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    try:
-        worksheet = await get_worksheet()
-        headers = await get_headers(worksheet)
-        text = "\n".join([f"• {safe_html(h)}" for h in headers]) if headers else "Ustunlar topilmadi"
-        await message.answer(f"📋 <b>Jadval ustunlari:</b>\n\n{text}")
-    except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(F.text == "🧾 Loglar")
-async def admin_logs_handler(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    try:
-        worksheet = await get_worksheet()
-        records = await get_all_records(worksheet)
-        count_col_name = await get_column_name(worksheet, ["Yuborish soni"])
-
-        if not count_col_name:
-            await message.answer("⚠️ 'Yuborish soni' ustuni topilmadi.")
-            return
-
-        top = []
-        for row in records:
-            student_name = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
-            count_value = normalize_text(row.get(count_col_name, "0")) or "0"
-            if student_name:
-                try:
-                    top.append((student_name, int(count_value)))
-                except Exception:
-                    top.append((student_name, 0))
-
-        top.sort(key=lambda x: x[1], reverse=True)
-        top = top[:10]
-
-        if not top:
-            await message.answer("ℹ️ Loglar topilmadi.")
-            return
-
-        text = "\n".join([f"{i+1}. {safe_html(name)} — <b>{cnt}</b>" for i, (name, cnt) in enumerate(top)])
-        await message.answer(f"🧾 <b>Eng ko'p yuborilganlar</b>\n\n{text}")
-    except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(F.text == "🔎 Qidiruv")
@@ -1106,7 +957,7 @@ async def admin_search_start_handler(message: Message, state: FSMContext):
 
     await state.set_state(RegisterStates.admin_search)
     await message.answer(
-        "🔎 <b>Qidiruv uchun talaba F.I.SH. yoki guruh yozing:</b>",
+        "🔎 Qidiruv uchun talaba F.I.SH. yoki guruh yozing:",
         reply_markup=make_keyboard([], add_cancel=True)
     )
 
@@ -1130,116 +981,22 @@ async def admin_search_handler(message: Message, state: FSMContext):
 
         chunks = []
         for item in results:
-            student_value = safe_html(item["student"])
-            group_value = safe_html(item["group"])
-            course_value = safe_html(item["course"])
-            education_value = safe_html(item["education"])
-            main_value = safe_html(item["main_phone"] or "-")
-            extra_value = safe_html(item["extra_phone"] or "-")
-            tg_id_value = safe_html(item["telegram_id"] or "-")
-            count_value = safe_html(item["count"] or "0")
-
             chunks.append(
-                f"🧑‍🎓 <b>{student_value}</b>\n"
-                f"👥 {group_value} | 📚 {course_value} | 🎓 {education_value}\n"
-                f"📱 {main_value}\n"
-                f"☎️ {extra_value}\n"
-                f"🆔 {tg_id_value}\n"
-                f"🧾 Yuborish soni: <b>{count_value}</b>"
+                f"🧑‍🎓 {item['student']}\n"
+                f"👥 {item['group']} | 📚 {item['course']} | 🎓 {item['education']}\n"
+                f"📱 {item['main_phone'] or '-'}\n"
+                f"☎️ {item['extra_phone'] or '-'}\n"
+                f"🆔 {item['telegram_id'] or '-'}\n"
+                f"🧾 Yuborish soni: {item['count'] or '0'}"
             )
 
         await message.answer(
-            "🔎 <b>Qidiruv natijalari</b>\n\n" + "\n\n".join(chunks),
+            "🔎 Qidiruv natijalari\n\n" + "\n\n".join(chunks),
             reply_markup=admin_keyboard()
         )
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(F.text == "🆔 ID bo'yicha qidiruv")
-async def admin_search_id_start_handler(message: Message, state: FSMContext):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(RegisterStates.admin_search_by_id)
-    await message.answer(
-        "🆔 <b>Telegram ID ni yuboring:</b>",
-        reply_markup=make_keyboard([], add_cancel=True)
-    )
-
-
-@dp.message(RegisterStates.admin_search_by_id, F.text)
-async def admin_search_id_handler(message: Message, state: FSMContext):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    text = normalize_text(message.text)
-    if text == "❌ Bekor qilish":
-        await cancel_flow(message, state)
-        return
-
-    try:
-        worksheet = await get_worksheet()
-        records = await get_all_records(worksheet)
-
-        found = []
-        for row in records:
-            tg_id = normalize_text(row.get("Telegram ID", ""))
-            if tg_id == text:
-                fish_value = normalize_text(row.get("F.I.SH.", "")) or normalize_text(row.get("F.I.SH", ""))
-                guruh_value = normalize_text(row.get("Guruh", ""))
-                kurs_value = normalize_text(row.get("Kurs", ""))
-                talim_value = normalize_text(row.get("Ta'lim shakli", ""))
-                asosiy_value = normalize_text(row.get("Asosiy nomer", "")) or "-"
-                qoshimcha_value = normalize_text(row.get("Qo'shimcha nomer", "")) or "-"
-
-                found.append(
-                    f"🧑‍🎓 <b>{safe_html(fish_value)}</b>\n"
-                    f"👥 {safe_html(guruh_value)}\n"
-                    f"📚 {safe_html(kurs_value)}\n"
-                    f"🎓 {safe_html(talim_value)}\n"
-                    f"📱 {safe_html(asosiy_value)}\n"
-                    f"☎️ {safe_html(qoshimcha_value)}\n"
-                    f"🆔 {safe_html(tg_id)}"
-                )
-
-        if not found:
-            await message.answer("ℹ️ Bu Telegram ID bo‘yicha ma’lumot topilmadi.", reply_markup=admin_keyboard())
-            await state.clear()
-            return
-
-        await message.answer(
-            "🆔 <b>ID bo‘yicha qidiruv natijasi</b>\n\n" + "\n\n".join(found[:10]),
-            reply_markup=admin_keyboard()
-        )
-        await state.clear()
-    except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
-
-
-@dp.message(F.text == "🕒 Oxirgi yangilanishlar")
-async def admin_recent_updates_handler(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    try:
-        updates = await get_recent_updates(10)
-        if not updates:
-            await message.answer("ℹ️ Oxirgi yangilanishlar topilmadi.")
-            return
-
-        text = "\n\n".join([
-            f"🧑‍🎓 <b>{safe_html(item['student'])}</b>\n"
-            f"👥 {safe_html(item['group'])}\n"
-            f"🕒 {safe_html(item['updated'])}\n"
-            f"🆔 {safe_html(item['telegram_id'] or '-')}"
-            for item in updates
-        ])
-
-        await message.answer(f"🕒 <b>Oxirgi yangilanishlar</b>\n\n{text}")
-    except Exception as e:
-        await message.answer(f"❌ {safe_html(str(e))}")
+        await message.answer(f"❌ {str(e)}")
 
 
 @dp.message(F.text == "🏠 Chiqish")
@@ -1252,6 +1009,11 @@ async def admin_exit_handler(message: Message, state: FSMContext):
         "✅ Admin paneldan chiqildi.",
         reply_markup=ReplyKeyboardRemove()
     )
+
+
+@dp.message()
+async def fallback_handler(message: Message):
+    await message.answer("ℹ️ Qayta boshlash uchun /start bosing.")
 
 
 async def main():
