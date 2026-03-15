@@ -30,7 +30,11 @@ if not GOOGLE_SHEET_NAME:
 if not GOOGLE_CREDENTIALS_JSON:
     raise ValueError("GOOGLE_CREDENTIALS_JSON topilmadi")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -45,15 +49,30 @@ class RegisterStates(StatesGroup):
 
 
 def get_worksheet():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    raw_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if not raw_json:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON topilmadi")
+
+    try:
+        creds_dict = json.loads(raw_json)
+    except Exception as e:
+        raise ValueError(f"GOOGLE_CREDENTIALS_JSON noto'g'ri formatda: {e}")
+
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open(GOOGLE_SHEET_NAME)
-    return spreadsheet.sheet1
+
+    try:
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open(GOOGLE_SHEET_NAME)
+        return spreadsheet.sheet1
+    except Exception as e:
+        raise ValueError(f"Google Sheets ulanishida xatolik: {e}")
 
 
 def get_headers(worksheet) -> List[str]:
@@ -175,6 +194,9 @@ def save_phone_to_sheet(student: str, course: str, group: str, education: str, n
     main_col = get_col_index_by_name(worksheet, "Asosiy nomer")
     extra_col = get_col_index_by_name(worksheet, "Qo'shimcha nomer")
 
+    if not main_col or not extra_col:
+        raise ValueError("Telefon ustunlari topilmadi")
+
     if number_type == "📱 Asosiy nomer":
         worksheet.update_cell(row_index, main_col, phone)
     elif number_type == "☎️ Qo'shimcha nomer":
@@ -224,13 +246,21 @@ def get_students(education: str, course: str, group: str):
 
 async def cancel_flow(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Amal bekor qilindi. /start bosing.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "Amal bekor qilindi. Qayta boshlash uchun /start bosing.",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     try:
         educations = get_educations()
+
+        if not educations:
+            await message.answer("Ta'lim shakllari topilmadi.")
+            return
+
         await state.clear()
         await message.answer(
             "🎓 Ta'lim shaklini tanlang:",
@@ -238,8 +268,8 @@ async def start_handler(message: Message, state: FSMContext):
         )
         await state.set_state(RegisterStates.choosing_education)
     except Exception as e:
-        logging.exception(e)
-        await message.answer("Botni ishga tushirishda xatolik bo'ldi.")
+        logging.exception("start_handler xatolik: %s", e)
+        await message.answer(str(e))
 
 
 @dp.message(Command("help"))
@@ -257,8 +287,15 @@ async def education_handler(message: Message, state: FSMContext):
     education = message.text.strip()
     courses = get_courses(education)
 
+    if not courses:
+        await message.answer("Bu ta'lim shakli uchun kurs topilmadi.")
+        return
+
     await state.update_data(education=education)
-    await message.answer("📚 Kursni tanlang:", reply_markup=make_keyboard(courses, per_row=3))
+    await message.answer(
+        "📚 Kursni tanlang:",
+        reply_markup=make_keyboard(courses, per_row=3)
+    )
     await state.set_state(RegisterStates.choosing_course)
 
 
@@ -269,8 +306,16 @@ async def course_handler(message: Message, state: FSMContext):
     course = message.text.strip()
 
     groups = get_groups(education, course)
+
+    if not groups:
+        await message.answer("Bu kurs uchun guruh topilmadi.")
+        return
+
     await state.update_data(course=course)
-    await message.answer("👥 Guruhni tanlang:", reply_markup=make_keyboard(groups, per_row=2))
+    await message.answer(
+        "👥 Guruhni tanlang:",
+        reply_markup=make_keyboard(groups, per_row=2)
+    )
     await state.set_state(RegisterStates.choosing_group)
 
 
@@ -282,8 +327,16 @@ async def group_handler(message: Message, state: FSMContext):
     group = message.text.strip()
 
     students = get_students(education, course, group)
+
+    if not students:
+        await message.answer("Bu guruhda talabalar topilmadi.")
+        return
+
     await state.update_data(group=group)
-    await message.answer("Talabani tanlang:", reply_markup=make_keyboard(students, per_row=1))
+    await message.answer(
+        "Talabani tanlang:",
+        reply_markup=make_keyboard(students, per_row=1)
+    )
     await state.set_state(RegisterStates.choosing_student)
 
 
@@ -291,20 +344,35 @@ async def group_handler(message: Message, state: FSMContext):
 async def student_handler(message: Message, state: FSMContext):
     student = message.text.strip()
     await state.update_data(student=student)
-    await message.answer("Nomer turini tanlang:", reply_markup=number_type_keyboard())
+    await message.answer(
+        "Nomer turini tanlang:",
+        reply_markup=number_type_keyboard()
+    )
     await state.set_state(RegisterStates.choosing_number_type)
 
 
 @dp.message(RegisterStates.choosing_number_type, F.text)
 async def number_type_handler(message: Message, state: FSMContext):
     number_type = message.text.strip()
+
+    if number_type not in ["📱 Asosiy nomer", "☎️ Qo'shimcha nomer"]:
+        await message.answer("Tugmalardan birini tanlang.")
+        return
+
     await state.update_data(number_type=number_type)
-    await message.answer("📞 Telefon raqam yuboring:", reply_markup=contact_keyboard())
+    await message.answer(
+        "📞 Telefon raqam yuboring:",
+        reply_markup=contact_keyboard()
+    )
     await state.set_state(RegisterStates.waiting_phone)
 
 
 @dp.message(RegisterStates.waiting_phone, F.contact)
 async def contact_handler(message: Message, state: FSMContext):
+    if not message.contact:
+        await message.answer("Kontakt topilmadi.")
+        return
+
     phone = normalize_phone(message.contact.phone_number)
     data = await state.get_data()
 
@@ -320,8 +388,8 @@ async def contact_handler(message: Message, state: FSMContext):
         await message.answer("✅ Saqlandi", reply_markup=ReplyKeyboardRemove())
         await state.clear()
     except Exception as e:
-        logging.exception(e)
-        await message.answer("Google Sheets ga yozishda xatolik bo'ldi.")
+        logging.exception("contact_handler xatolik: %s", e)
+        await message.answer(str(e))
 
 
 @dp.message(RegisterStates.waiting_phone, F.text)
@@ -347,8 +415,8 @@ async def phone_text_handler(message: Message, state: FSMContext):
         await message.answer("✅ Saqlandi", reply_markup=ReplyKeyboardRemove())
         await state.clear()
     except Exception as e:
-        logging.exception(e)
-        await message.answer("Google Sheets ga yozishda xatolik bo'ldi.")
+        logging.exception("phone_text_handler xatolik: %s", e)
+        await message.answer(str(e))
 
 
 @dp.message()
@@ -357,6 +425,7 @@ async def fallback_handler(message: Message):
 
 
 async def main():
+    logging.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
 
