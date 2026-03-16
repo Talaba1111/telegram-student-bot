@@ -8,13 +8,14 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import gspread
+from gspread.cell import Cell
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 
@@ -54,13 +55,18 @@ class RegisterStates(StatesGroup):
     choosing_course = State()
     choosing_group = State()
     choosing_student = State()
-    confirm_edit = State()
     waiting_main_phone = State()
     waiting_extra_phone = State()
     confirm_save = State()
+    confirm_edit = State()
+    recover_main_phone = State()
+    recover_extra_phone = State()
     admin_search = State()
 
 
+# =========================
+# HELPERS
+# =========================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -101,65 +107,77 @@ def unique_values(values: List[str]) -> List[str]:
     return result
 
 
-def make_keyboard(items: List[str], per_row: int = 2, add_cancel: bool = True) -> ReplyKeyboardMarkup:
-    keyboard = []
+def build_paginated_keyboard(
+    prefix: str,
+    items: List[str],
+    page: int = 0,
+    page_size: int = 8,
+    row_width: int = 1,
+    back_callback: Optional[str] = None,
+) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * page_size
+    end = start + page_size
+    page_items = items[start:end]
+
+    rows = []
     row = []
 
-    for item in items:
-        row.append(KeyboardButton(text=item))
-        if len(row) == per_row:
-            keyboard.append(row)
+    for idx, item in enumerate(page_items, start=start):
+        row.append(InlineKeyboardButton(text=item, callback_data=f"{prefix}|{idx}"))
+        if len(row) == row_width:
+            rows.append(row)
             row = []
 
     if row:
-        keyboard.append(row)
+        rows.append(row)
 
-    if add_cancel:
-        keyboard.append([KeyboardButton(text="❌ Bekor qilish")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{prefix}_page|{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{prefix}_page|{page+1}"))
+    if nav:
+        rows.append(nav)
 
-    return ReplyKeyboardMarkup(
-        keyboard=keyboard,
-        resize_keyboard=True,
-        one_time_keyboard=True
+    bottom = []
+    if back_callback:
+        bottom.append(InlineKeyboardButton(text="🔙 Orqaga", callback_data=back_callback))
+    bottom.append(InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel"))
+    rows.append(bottom)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="save_yes"),
+                InlineKeyboardButton(text="✏️ Qayta kiritish", callback_data="save_rewrite"),
+            ],
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")],
+        ]
     )
 
 
-def confirm_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Tasdiqlash"), KeyboardButton(text="✏️ Qayta kiritish")],
-            [KeyboardButton(text="❌ Bekor qilish")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
+def build_existing_edit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Asosiy raqamni o'zgartirish", callback_data="edit_main")],
+            [InlineKeyboardButton(text="☎️ Qo'shimcha raqamni o'zgartirish", callback_data="edit_extra")],
+            [InlineKeyboardButton(text="🔁 Ikkalasini qayta kiritish", callback_data="edit_both")],
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")],
+        ]
     )
 
 
-def edit_choice_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📱 Asosiy raqamni o'zgartirish")],
-            [KeyboardButton(text="☎️ Qo'shimcha raqamni o'zgartirish")],
-            [KeyboardButton(text="🔁 Ikkalasini qayta kiritish")],
-            [KeyboardButton(text="❌ Bekor qilish")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-
-def admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="🔄 Yangilash")],
-            [KeyboardButton(text="🔎 Qidiruv")],
-            [KeyboardButton(text="🏠 Chiqish")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-
+# =========================
+# CHANNEL CHECK
+# =========================
 async def check_subscription(user_id: int) -> bool:
     if not REQUIRED_CHANNEL:
         return True
@@ -175,6 +193,9 @@ async def check_subscription(user_id: int) -> bool:
         return False
 
 
+# =========================
+# GOOGLE SHEETS
+# =========================
 def get_credentials():
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -199,10 +220,7 @@ def get_worksheet_sync():
 
 
 async def get_worksheet():
-    try:
-        return await asyncio.to_thread(get_worksheet_sync)
-    except Exception as e:
-        raise ValueError(f"Google Sheets ulanishida xatolik: {e}")
+    return await asyncio.to_thread(get_worksheet_sync)
 
 
 async def get_headers(worksheet) -> List[str]:
@@ -216,7 +234,6 @@ async def get_all_records(worksheet):
 async def get_column_name(worksheet, possible_names: List[str]) -> Optional[str]:
     headers = await get_headers(worksheet)
     normalized_headers = {normalize_header(h): h for h in headers}
-
     for name in possible_names:
         key = normalize_header(name)
         if key in normalized_headers:
@@ -234,7 +251,6 @@ async def get_col_index_by_name(worksheet, col_name: str) -> Optional[int]:
 
 async def ensure_extra_columns(worksheet):
     headers = await get_headers(worksheet)
-
     columns_to_add = [
         "Asosiy nomer",
         "Qo'shimcha nomer",
@@ -244,7 +260,6 @@ async def ensure_extra_columns(worksheet):
         "Oxirgi yangilanish",
         "Yuborish soni",
     ]
-
     current_headers = headers[:]
     for col in columns_to_add:
         if col not in current_headers:
@@ -253,16 +268,10 @@ async def ensure_extra_columns(worksheet):
 
 
 async def get_required_columns(worksheet) -> Dict[str, str]:
-    education_col = await get_column_name(
-        worksheet,
-        ["Ta'lim shakli", "Ta’lim shakli", "Talim shakli", "talim shakli"]
-    )
+    education_col = await get_column_name(worksheet, ["Ta'lim shakli", "Ta’lim shakli", "Talim shakli", "talim shakli"])
     course_col = await get_column_name(worksheet, ["Kurs", "kurs"])
     group_col = await get_column_name(worksheet, ["Guruh", "guruh", "Group", "group"])
-    student_col = await get_column_name(
-        worksheet,
-        ["F.I.SH.", "F.I.SH", "FISH", "Fish", "FIO", "Talaba"]
-    )
+    student_col = await get_column_name(worksheet, ["F.I.SH.", "F.I.SH", "FISH", "Fish", "FIO", "Talaba"])
 
     if not education_col:
         raise ValueError("Google Sheetsda Ta'lim shakli ustuni topilmadi")
@@ -286,11 +295,7 @@ async def fetch_sheet_snapshot() -> Dict:
     await ensure_extra_columns(worksheet)
     records = await get_all_records(worksheet)
     columns = await get_required_columns(worksheet)
-
-    return {
-        "records": records,
-        "columns": columns,
-    }
+    return {"records": records, "columns": columns}
 
 
 def get_educations_from_snapshot(snapshot: Dict) -> List[str]:
@@ -302,7 +307,6 @@ def get_educations_from_snapshot(snapshot: Dict) -> List[str]:
 def get_courses_from_snapshot(snapshot: Dict, education: str) -> List[str]:
     records = snapshot["records"]
     columns = snapshot["columns"]
-
     return unique_values([
         normalize_text(r.get(columns["course"], ""))
         for r in records
@@ -313,7 +317,6 @@ def get_courses_from_snapshot(snapshot: Dict, education: str) -> List[str]:
 def get_groups_from_snapshot(snapshot: Dict, education: str, course: str) -> List[str]:
     records = snapshot["records"]
     columns = snapshot["columns"]
-
     return unique_values([
         normalize_text(r.get(columns["group"], ""))
         for r in records
@@ -325,7 +328,6 @@ def get_groups_from_snapshot(snapshot: Dict, education: str, course: str) -> Lis
 def get_students_from_snapshot(snapshot: Dict, education: str, course: str, group: str) -> List[str]:
     records = snapshot["records"]
     columns = snapshot["columns"]
-
     return unique_values([
         normalize_text(r.get(columns["student"], ""))
         for r in records
@@ -335,10 +337,47 @@ def get_students_from_snapshot(snapshot: Dict, education: str, course: str, grou
     ])
 
 
+def get_registration_by_tg_id(snapshot: Dict, tg_id: str) -> Optional[Dict[str, str]]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
+    for row in records:
+        row_tg_id = normalize_text(row.get("Telegram ID", ""))
+        if row_tg_id == tg_id:
+            return {
+                "student": normalize_text(row.get(columns["student"], "")),
+                "course": normalize_text(row.get(columns["course"], "")),
+                "group": normalize_text(row.get(columns["group"], "")),
+                "education": normalize_text(row.get(columns["education"], "")),
+                "main_phone": normalize_text(row.get("Asosiy nomer", "")),
+                "extra_phone": normalize_text(row.get("Qo'shimcha nomer", "")),
+                "telegram_id": row_tg_id,
+            }
+    return None
+
+
+def find_student_by_phones(snapshot: Dict, main_phone: str, extra_phone: str) -> Optional[Dict[str, str]]:
+    records = snapshot["records"]
+    columns = snapshot["columns"]
+    for row in records:
+        if (
+            normalize_text(row.get("Asosiy nomer", "")) == main_phone
+            and normalize_text(row.get("Qo'shimcha nomer", "")) == extra_phone
+        ):
+            return {
+                "student": normalize_text(row.get(columns["student"], "")),
+                "course": normalize_text(row.get(columns["course"], "")),
+                "group": normalize_text(row.get(columns["group"], "")),
+                "education": normalize_text(row.get(columns["education"], "")),
+                "main_phone": normalize_text(row.get("Asosiy nomer", "")),
+                "extra_phone": normalize_text(row.get("Qo'shimcha nomer", "")),
+                "telegram_id": normalize_text(row.get("Telegram ID", "")),
+            }
+    return None
+
+
 def get_saved_data_from_snapshot(snapshot: Dict, student: str, course: str, group: str, education: str) -> Dict[str, str]:
     records = snapshot["records"]
     columns = snapshot["columns"]
-
     for row in records:
         if (
             normalize_text(row.get(columns["student"], "")) == student
@@ -351,24 +390,12 @@ def get_saved_data_from_snapshot(snapshot: Dict, student: str, course: str, grou
                 "extra_phone": normalize_text(row.get("Qo'shimcha nomer", "")),
                 "telegram_id": normalize_text(row.get("Telegram ID", "")),
             }
-
-    return {
-        "main_phone": "",
-        "extra_phone": "",
-        "telegram_id": "",
-    }
+    return {"main_phone": "", "extra_phone": "", "telegram_id": ""}
 
 
-async def find_student_row_index(
-    worksheet,
-    student: str,
-    course: str,
-    group: str,
-    education: str
-) -> Optional[int]:
+async def find_student_row_index(worksheet, student: str, course: str, group: str, education: str) -> Optional[int]:
     records = await get_all_records(worksheet)
     columns = await get_required_columns(worksheet)
-
     for row_index, row in enumerate(records, start=2):
         if (
             normalize_text(row.get(columns["student"], "")) == student
@@ -378,6 +405,52 @@ async def find_student_row_index(
         ):
             return row_index
     return None
+
+
+async def rebind_telegram_owner(main_phone: str, extra_phone: str, telegram_id: str, username: str, full_name: str):
+    worksheet = await get_worksheet()
+    await ensure_extra_columns(worksheet)
+    records = await get_all_records(worksheet)
+    columns = await get_required_columns(worksheet)
+
+    target_index = None
+    for row_index, row in enumerate(records, start=2):
+        if (
+            normalize_text(row.get("Asosiy nomer", "")) == main_phone
+            and normalize_text(row.get("Qo'shimcha nomer", "")) == extra_phone
+        ):
+            target_index = row_index
+            break
+
+    if not target_index:
+        raise ValueError("Bunday raqamlar juftligi topilmadi")
+
+    # Yangi id boshqa talabada turmasin
+    for row_index, row in enumerate(records, start=2):
+        row_tg_id = normalize_text(row.get("Telegram ID", ""))
+        if row_tg_id == telegram_id and row_index != target_index:
+            student_name = normalize_text(row.get(columns["student"], ""))
+            raise ValueError(f"Bu Telegram ID allaqachon boshqa talabaga biriktirilgan: {student_name}")
+
+    tg_id_col = await get_col_index_by_name(worksheet, "Telegram ID")
+    tg_username_col = await get_col_index_by_name(worksheet, "Telegram Username")
+    tg_name_col = await get_col_index_by_name(worksheet, "Telegram Full Name")
+    updated_col = await get_col_index_by_name(worksheet, "Oxirgi yangilanish")
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cells = []
+
+    if tg_id_col:
+        cells.append(Cell(target_index, tg_id_col, telegram_id))
+    if tg_username_col:
+        cells.append(Cell(target_index, tg_username_col, username))
+    if tg_name_col:
+        cells.append(Cell(target_index, tg_name_col, full_name))
+    if updated_col:
+        cells.append(Cell(target_index, updated_col, now_str))
+
+    if cells:
+        await asyncio.to_thread(worksheet.update_cells, cells)
 
 
 async def save_full_data_to_sheet(
@@ -394,16 +467,19 @@ async def save_full_data_to_sheet(
     worksheet = await get_worksheet()
     await ensure_extra_columns(worksheet)
 
-    row_index = await find_student_row_index(
-        worksheet=worksheet,
-        student=student,
-        course=course,
-        group=group,
-        education=education,
-    )
-
+    row_index = await find_student_row_index(worksheet, student, course, group, education)
     if not row_index:
         raise ValueError("Tanlangan talaba jadvaldan topilmadi")
+
+    records = await get_all_records(worksheet)
+    columns = await get_required_columns(worksheet)
+
+    # Bir Telegram ID boshqa talabada ishlatilmasin
+    for idx, row in enumerate(records, start=2):
+        row_tg_id = normalize_text(row.get("Telegram ID", ""))
+        if row_tg_id == telegram_id and idx != row_index:
+            student_name = normalize_text(row.get(columns["student"], ""))
+            raise ValueError(f"Bu Telegram ID allaqachon boshqa talabaga biriktirilgan: {student_name}")
 
     main_col = await get_col_index_by_name(worksheet, "Asosiy nomer")
     extra_col = await get_col_index_by_name(worksheet, "Qo'shimcha nomer")
@@ -434,19 +510,24 @@ async def save_full_data_to_sheet(
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    updates = [
-        (row_index, main_col, main_phone),
-        (row_index, extra_col, extra_phone),
-        (row_index, tg_id_col, telegram_id),
-        (row_index, tg_username_col, telegram_username),
-        (row_index, tg_name_col, telegram_full_name),
-        (row_index, updated_col, now_str),
-        (row_index, count_col, str(current_count + 1)),
-    ]
+    cells = []
+    if main_col:
+        cells.append(Cell(row_index, main_col, main_phone))
+    if extra_col:
+        cells.append(Cell(row_index, extra_col, extra_phone))
+    if tg_id_col:
+        cells.append(Cell(row_index, tg_id_col, telegram_id))
+    if tg_username_col:
+        cells.append(Cell(row_index, tg_username_col, telegram_username))
+    if tg_name_col:
+        cells.append(Cell(row_index, tg_name_col, telegram_full_name))
+    if updated_col:
+        cells.append(Cell(row_index, updated_col, now_str))
+    if count_col:
+        cells.append(Cell(row_index, count_col, str(current_count + 1)))
 
-    for r, c, value in updates:
-        if c:
-            await asyncio.to_thread(worksheet.update_cell, r, c, value)
+    if cells:
+        await asyncio.to_thread(worksheet.update_cells, cells)
 
 
 async def get_sheet_stats() -> Tuple[int, int, int]:
@@ -497,7 +578,21 @@ async def search_students(keyword: str) -> List[dict]:
     return found[:10]
 
 
-async def show_education_step(message: Message, state: FSMContext):
+# =========================
+# FLOW HELPERS
+# =========================
+async def cancel_flow(state: FSMContext, target_message: Optional[Message] = None, callback: Optional[CallbackQuery] = None):
+    await state.clear()
+    text = "❌ Amal bekor qilindi.\nQayta boshlash uchun /start bosing."
+
+    if callback and callback.message:
+        await callback.message.edit_text(text)
+        await callback.answer()
+    elif target_message:
+        await target_message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+
+async def ask_educations(message: Message, state: FSMContext):
     snapshot = await fetch_sheet_snapshot()
     educations = get_educations_from_snapshot(snapshot)
 
@@ -506,19 +601,18 @@ async def show_education_step(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await state.update_data(sheet_snapshot=snapshot)
+    await state.update_data(sheet_snapshot=snapshot, education_options=educations)
 
     await message.answer(
         "🎓 Ta'lim shaklini tanlang:",
-        reply_markup=make_keyboard(educations, per_row=2)
+        reply_markup=build_paginated_keyboard("edu", educations, page=0, page_size=8, row_width=2)
     )
     await state.set_state(RegisterStates.choosing_education)
 
 
 async def show_confirm_step(message: Message, state: FSMContext):
     data = await state.get_data()
-
-    await message.answer(
+    text = (
         "📝 Kiritilgan ma'lumotlarni tekshiring:\n\n"
         f"🎓 Ta'lim shakli: {data.get('education', '')}\n"
         f"📚 Kurs: {data.get('course', '')}\n"
@@ -526,20 +620,15 @@ async def show_confirm_step(message: Message, state: FSMContext):
         f"🧑‍🎓 Talaba: {data.get('student', '')}\n"
         f"📱 Asosiy raqam: {data.get('main_phone', '')}\n"
         f"☎️ Qo'shimcha raqam: {data.get('extra_phone', '')}\n\n"
-        "✅ Tasdiqlaysizmi yoki ✏️ qayta kiritasizmi?",
-        reply_markup=confirm_keyboard()
+        "Tasdiqlaysizmi?"
     )
+    await message.answer(text, reply_markup=build_confirm_keyboard())
     await state.set_state(RegisterStates.confirm_save)
 
 
-async def cancel_flow(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ Amal bekor qilindi.\nQayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
+# =========================
+# USER COMMANDS
+# =========================
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     try:
@@ -556,26 +645,69 @@ async def start_handler(message: Message, state: FSMContext):
             )
             return
 
-        await show_education_step(message, state)
+        snapshot = await fetch_sheet_snapshot()
+        existing = get_registration_by_tg_id(snapshot, str(message.from_user.id))
+
+        if existing:
+            await state.clear()
+            await state.update_data(
+                sheet_snapshot=snapshot,
+                student=existing["student"],
+                course=existing["course"],
+                group=existing["group"],
+                education=existing["education"],
+                main_phone=existing["main_phone"],
+                extra_phone=existing["extra_phone"],
+            )
+            await message.answer(
+                "ℹ️ Siz avval ro'yxatdan o'tgansiz.\n\n"
+                f"🎓 Ta'lim shakli: {existing['education']}\n"
+                f"📚 Kurs: {existing['course']}\n"
+                f"👥 Guruh: {existing['group']}\n"
+                f"🧑‍🎓 Talaba: {existing['student']}\n"
+                f"📱 Asosiy raqam: {existing['main_phone'] or '-'}\n"
+                f"☎️ Qo'shimcha raqam: {existing['extra_phone'] or '-'}\n\n"
+                "Siz faqat o'zingizning raqamlaringizni o'zgartira olasiz.\n"
+                "Agar akkauntingiz o'chgan bo'lsa, /recover ishlating.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await message.answer("Tanlang:", reply_markup=build_existing_edit_keyboard())
+            await state.set_state(RegisterStates.confirm_edit)
+            return
+
+        await ask_educations(message, state)
 
     except Exception as e:
         logging.exception("start_handler xatolik: %s", e)
         await message.answer(f"❌ {str(e)}")
 
 
+@dp.message(Command("recover"))
+async def recover_start_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "♻️ Tiklash rejimi.\n\n"
+        "Avval eski ASOSIY raqamingizni kiriting.\n"
+        "Format: +998XXXXXXXXX\n\n"
+        "Bekor qilish uchun /cancel."
+    )
+    await state.set_state(RegisterStates.recover_main_phone)
+
+
+@dp.message(Command("cancel"))
+async def cancel_command_handler(message: Message, state: FSMContext):
+    await cancel_flow(state, target_message=message)
+
+
 @dp.message(Command("help"))
 async def help_handler(message: Message):
     await message.answer(
         "ℹ️ Foydalanish tartibi:\n\n"
-        "1. /start bosing\n"
-        "2. 🎓 Ta'lim shaklini tanlang\n"
-        "3. 📚 Kursni tanlang\n"
-        "4. 👥 Guruhni tanlang\n"
-        "5. 🧑‍🎓 Talabani tanlang\n"
-        "6. 📱 Asosiy raqamni yozing\n"
-        "7. ☎️ Qo'shimcha raqamni yozing\n"
-        "8. ✅ Tasdiqlang\n\n"
-        "Telefon raqamlar faqat +998XXXXXXXXX formatida qabul qilinadi."
+        "/start — ro'yxatdan o'tish yoki tahrirlash\n"
+        "/recover — udalenniy akkauntdan keyin yangi akkauntga tiklash\n"
+        "/cancel — bekor qilish\n"
+        "/id — Telegram ID ni ko'rish\n\n"
+        "Telefon raqam faqat +998XXXXXXXXX formatida qabul qilinadi."
     )
 
 
@@ -584,7 +716,6 @@ async def my_id_handler(message: Message):
     if not message.from_user:
         await message.answer("❌ ID aniqlanmadi.")
         return
-
     await message.answer(f"🆔 Sizning Telegram ID: {message.from_user.id}")
 
 
@@ -593,289 +724,377 @@ async def ping_handler(message: Message):
     await message.answer("🏓 Bot ishlayapti.")
 
 
-@dp.message(F.text == "❌ Bekor qilish")
-async def cancel_handler(message: Message, state: FSMContext):
-    await cancel_flow(message, state)
+# =========================
+# CALLBACK HANDLERS
+# =========================
+@dp.callback_query(F.data == "cancel")
+async def callback_cancel_handler(callback: CallbackQuery, state: FSMContext):
+    await cancel_flow(state, callback=callback)
 
 
-@dp.message(RegisterStates.choosing_education, F.text)
-async def education_handler(message: Message, state: FSMContext):
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_education, F.data.startswith("edu_page|"))
+async def edu_page_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("education_options", [])
+    page = int(callback.data.split("|")[1])
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("edu", options, page=page, page_size=8, row_width=2)
+        )
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_education, F.data.startswith("edu|"))
+async def education_callback(callback: CallbackQuery, state: FSMContext):
     try:
         data = await state.get_data()
+        options = data.get("education_options", [])
+        idx = int(callback.data.split("|")[1])
+
+        if idx < 0 or idx >= len(options):
+            await callback.answer("Noto'g'ri tanlov", show_alert=True)
+            return
+
+        education = options[idx]
         snapshot = data.get("sheet_snapshot")
-
-        if not snapshot:
-            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
-            await state.clear()
-            return
-
-        education = normalize_text(message.text)
-        educations = get_educations_from_snapshot(snapshot)
-
-        if education not in educations:
-            await message.answer("⚠️ Iltimos, tugmalardan birini tanlang.")
-            return
-
         courses = get_courses_from_snapshot(snapshot, education)
+
         if not courses:
-            await message.answer("⚠️ Bu ta'lim shakli uchun kurs topilmadi.")
+            await callback.answer("Kurs topilmadi", show_alert=True)
             return
 
-        await state.update_data(education=education)
-        await message.answer(
-            "📚 Kursni tanlang:",
-            reply_markup=make_keyboard(courses, per_row=3)
-        )
+        await state.update_data(education=education, course_options=courses)
+
+        if callback.message:
+            await callback.message.edit_text(
+                f"🎓 Ta'lim shakli: {education}\n\n📚 Kursni tanlang:"
+            )
+            await callback.message.edit_reply_markup(
+                reply_markup=build_paginated_keyboard("course", courses, page=0, page_size=9, row_width=3)
+            )
         await state.set_state(RegisterStates.choosing_course)
+        await callback.answer()
 
     except Exception as e:
-        logging.exception("education_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+        logging.exception("education_callback xatolik: %s", e)
+        if callback.message:
+            await callback.message.edit_text(f"❌ {str(e)}")
+        await callback.answer()
 
 
-@dp.message(RegisterStates.choosing_course, F.text)
-async def course_handler(message: Message, state: FSMContext):
+@dp.callback_query(RegisterStates.choosing_course, F.data.startswith("course_page|"))
+async def course_page_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("course_options", [])
+    page = int(callback.data.split("|")[1])
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard(
+                "course", options, page=page, page_size=9, row_width=3, back_callback="back_to_edu"
+            )
+        )
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_course, F.data == "back_to_edu")
+async def back_to_edu_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("education_options", [])
+    if callback.message:
+        await callback.message.edit_text("🎓 Ta'lim shaklini tanlang:")
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("edu", options, page=0, page_size=8, row_width=2)
+        )
+    await state.set_state(RegisterStates.choosing_education)
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_course, F.data.startswith("course|"))
+async def course_callback(callback: CallbackQuery, state: FSMContext):
     try:
         data = await state.get_data()
+        options = data.get("course_options", [])
+        idx = int(callback.data.split("|")[1])
+
+        if idx < 0 or idx >= len(options):
+            await callback.answer("Noto'g'ri tanlov", show_alert=True)
+            return
+
+        course = options[idx]
         snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
-
-        if not snapshot:
-            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
-            await state.clear()
-            return
-
-        course = normalize_text(message.text)
-        courses = get_courses_from_snapshot(snapshot, education)
-
-        if course not in courses:
-            await message.answer("⚠️ Iltimos, kursni tugmalardan tanlang.")
-            return
-
         groups = get_groups_from_snapshot(snapshot, education, course)
+
         if not groups:
-            await message.answer("⚠️ Bu kurs uchun guruh topilmadi.")
+            await callback.answer("Guruh topilmadi", show_alert=True)
             return
 
-        await state.update_data(course=course)
-        await message.answer(
-            "👥 Guruhni tanlang:",
-            reply_markup=make_keyboard(groups, per_row=2)
-        )
+        await state.update_data(course=course, group_options=groups)
+
+        if callback.message:
+            await callback.message.edit_text(
+                f"🎓 Ta'lim shakli: {education}\n📚 Kurs: {course}\n\n👥 Guruhni tanlang:"
+            )
+            await callback.message.edit_reply_markup(
+                reply_markup=build_paginated_keyboard("group", groups, page=0, page_size=8, row_width=2, back_callback="back_to_course")
+            )
         await state.set_state(RegisterStates.choosing_group)
+        await callback.answer()
 
     except Exception as e:
-        logging.exception("course_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+        logging.exception("course_callback xatolik: %s", e)
+        if callback.message:
+            await callback.message.edit_text(f"❌ {str(e)}")
+        await callback.answer()
 
 
-@dp.message(RegisterStates.choosing_group, F.text)
-async def group_handler(message: Message, state: FSMContext):
+@dp.callback_query(RegisterStates.choosing_group, F.data.startswith("group_page|"))
+async def group_page_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("group_options", [])
+    page = int(callback.data.split("|")[1])
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("group", options, page=page, page_size=8, row_width=2, back_callback="back_to_course")
+        )
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_group, F.data == "back_to_course")
+async def back_to_course_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("course_options", [])
+    education = data.get("education", "")
+    if callback.message:
+        await callback.message.edit_text(
+            f"🎓 Ta'lim shakli: {education}\n\n📚 Kursni tanlang:"
+        )
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("course", options, page=0, page_size=9, row_width=3, back_callback="back_to_edu")
+        )
+    await state.set_state(RegisterStates.choosing_course)
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_group, F.data.startswith("group|"))
+async def group_callback(callback: CallbackQuery, state: FSMContext):
     try:
         data = await state.get_data()
+        options = data.get("group_options", [])
+        idx = int(callback.data.split("|")[1])
+
+        if idx < 0 or idx >= len(options):
+            await callback.answer("Noto'g'ri tanlov", show_alert=True)
+            return
+
+        group = options[idx]
         snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
         course = data.get("course", "")
-
-        if not snapshot:
-            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
-            await state.clear()
-            return
-
-        group = normalize_text(message.text)
-        groups = get_groups_from_snapshot(snapshot, education, course)
-
-        if group not in groups:
-            await message.answer("⚠️ Iltimos, guruhni tugmalardan tanlang.")
-            return
-
         students = get_students_from_snapshot(snapshot, education, course, group)
+
         if not students:
-            await message.answer("⚠️ Bu guruhda talabalar topilmadi.")
+            await callback.answer("Talaba topilmadi", show_alert=True)
             return
 
-        await state.update_data(group=group)
-        await message.answer(
-            "🧑‍🎓 Talabani tanlang:",
-            reply_markup=make_keyboard(students, per_row=1)
-        )
+        await state.update_data(group=group, student_options=students)
+
+        if callback.message:
+            await callback.message.edit_text(
+                f"🎓 Ta'lim shakli: {education}\n📚 Kurs: {course}\n👥 Guruh: {group}\n\n🧑‍🎓 Talabani tanlang:"
+            )
+            await callback.message.edit_reply_markup(
+                reply_markup=build_paginated_keyboard("student", students, page=0, page_size=8, row_width=1, back_callback="back_to_group")
+            )
         await state.set_state(RegisterStates.choosing_student)
+        await callback.answer()
 
     except Exception as e:
-        logging.exception("group_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+        logging.exception("group_callback xatolik: %s", e)
+        if callback.message:
+            await callback.message.edit_text(f"❌ {str(e)}")
+        await callback.answer()
 
 
-@dp.message(RegisterStates.choosing_student, F.text)
-async def student_handler(message: Message, state: FSMContext):
+@dp.callback_query(RegisterStates.choosing_student, F.data.startswith("student_page|"))
+async def student_page_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("student_options", [])
+    page = int(callback.data.split("|")[1])
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("student", options, page=page, page_size=8, row_width=1, back_callback="back_to_group")
+        )
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_student, F.data == "back_to_group")
+async def back_to_group_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    options = data.get("group_options", [])
+    education = data.get("education", "")
+    course = data.get("course", "")
+    if callback.message:
+        await callback.message.edit_text(
+            f"🎓 Ta'lim shakli: {education}\n📚 Kurs: {course}\n\n👥 Guruhni tanlang:"
+        )
+        await callback.message.edit_reply_markup(
+            reply_markup=build_paginated_keyboard("group", options, page=0, page_size=8, row_width=2, back_callback="back_to_course")
+        )
+    await state.set_state(RegisterStates.choosing_group)
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.choosing_student, F.data.startswith("student|"))
+async def student_callback(callback: CallbackQuery, state: FSMContext):
     try:
         data = await state.get_data()
+        options = data.get("student_options", [])
+        idx = int(callback.data.split("|")[1])
+
+        if idx < 0 or idx >= len(options):
+            await callback.answer("Noto'g'ri tanlov", show_alert=True)
+            return
+
+        student = options[idx]
         snapshot = data.get("sheet_snapshot")
         education = data.get("education", "")
         course = data.get("course", "")
         group = data.get("group", "")
 
-        if not snapshot:
-            await message.answer("⚠️ Sessiya tugagan. Qayta /start bosing.")
-            await state.clear()
-            return
+        if callback.from_user:
+            existing = get_registration_by_tg_id(snapshot, str(callback.from_user.id))
+            if existing:
+                same_row = (
+                    existing["student"] == student
+                    and existing["course"] == course
+                    and existing["group"] == group
+                    and existing["education"] == education
+                )
+                if not same_row:
+                    await callback.answer("Bu Telegram ID boshqa talabaga bog'langan.", show_alert=True)
+                    return
 
-        student = normalize_text(message.text)
-        students = get_students_from_snapshot(snapshot, education, course, group)
-
-        if student not in students:
-            await message.answer("⚠️ Iltimos, talabani tugmalardan tanlang.")
-            return
-
-        saved = get_saved_data_from_snapshot(snapshot, student, course, group, education)
         await state.update_data(student=student)
 
-        if saved["telegram_id"] and message.from_user and saved["telegram_id"] == str(message.from_user.id):
-            if saved["main_phone"] or saved["extra_phone"]:
-                await message.answer(
-                    "ℹ️ Bu talaba uchun oldin ma'lumot saqlangan.\n\n"
-                    f"📱 Asosiy raqam: {saved['main_phone'] or '-'}\n"
-                    f"☎️ Qo'shimcha raqam: {saved['extra_phone'] or '-'}\n\n"
-                    "Qaysi qismini o'zgartirmoqchisiz?",
-                    reply_markup=edit_choice_keyboard()
-                )
-                await state.set_state(RegisterStates.confirm_edit)
-                return
+        if callback.message:
+            await callback.message.edit_text(
+                f"🧑‍🎓 Talaba: {student}\n\n📱 Endi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX"
+            )
+            await callback.message.edit_reply_markup(reply_markup=None)
 
-        await message.answer(
-            f"✅ Tanlangan talaba: {student}\n\n"
-            "📱 Endi ASOSIY raqamni yozing\n"
-            "Format: +998XXXXXXXXX",
-            reply_markup=make_keyboard([], add_cancel=True)
-        )
         await state.set_state(RegisterStates.waiting_main_phone)
+        await callback.answer()
 
     except Exception as e:
-        logging.exception("student_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+        logging.exception("student_callback xatolik: %s", e)
+        if callback.message:
+            await callback.message.edit_text(f"❌ {str(e)}")
+        await callback.answer()
 
 
-@dp.message(RegisterStates.confirm_edit, F.text)
-async def confirm_edit_handler(message: Message, state: FSMContext):
-    try:
-        text = normalize_text(message.text)
-
-        if text == "📱 Asosiy raqamni o'zgartirish":
-            await message.answer(
-                "📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX",
-                reply_markup=make_keyboard([], add_cancel=True)
-            )
-            await state.set_state(RegisterStates.waiting_main_phone)
-            return
-
-        if text == "☎️ Qo'shimcha raqamni o'zgartirish":
-            await message.answer(
-                "☎️ Yangi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX",
-                reply_markup=make_keyboard([], add_cancel=True)
-            )
-            await state.set_state(RegisterStates.waiting_extra_phone)
-            return
-
-        if text == "🔁 Ikkalasini qayta kiritish":
-            await state.update_data(main_phone="", extra_phone="")
-            await message.answer(
-                "📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX",
-                reply_markup=make_keyboard([], add_cancel=True)
-            )
-            await state.set_state(RegisterStates.waiting_main_phone)
-            return
-
-        await message.answer("⚠️ Iltimos, tugmalardan birini tanlang.")
-
-    except Exception as e:
-        logging.exception("confirm_edit_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+@dp.callback_query(RegisterStates.confirm_edit, F.data == "edit_main")
+async def edit_main_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.message:
+        await callback.message.edit_text("📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX")
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(RegisterStates.waiting_main_phone)
+    await callback.answer()
 
 
+@dp.callback_query(RegisterStates.confirm_edit, F.data == "edit_extra")
+async def edit_extra_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.message:
+        await callback.message.edit_text("☎️ Yangi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX")
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(RegisterStates.waiting_extra_phone)
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.confirm_edit, F.data == "edit_both")
+async def edit_both_callback(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(main_phone="", extra_phone="")
+    if callback.message:
+        await callback.message.edit_text("📱 Yangi ASOSIY raqamni yozing\nFormat: +998XXXXXXXXX")
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(RegisterStates.waiting_main_phone)
+    await callback.answer()
+
+
+# =========================
+# TEXT INPUTS
+# =========================
 @dp.message(RegisterStates.waiting_main_phone, F.text)
 async def main_phone_text_handler(message: Message, state: FSMContext):
-    try:
-        text = normalize_text(message.text)
+    text = normalize_text(message.text)
 
-        if text == "❌ Bekor qilish":
-            await cancel_flow(message, state)
-            return
+    if text == "/cancel":
+        await cancel_flow(state, target_message=message)
+        return
 
-        phone = normalize_phone(text)
-        if not is_valid_uz_phone(phone):
-            await message.answer("⚠️ Asosiy raqam noto'g'ri. Masalan: +998901234567")
-            return
+    phone = normalize_phone(text)
+    if not is_valid_uz_phone(phone):
+        await message.answer("⚠️ Asosiy raqam noto'g'ri. Masalan: +998901234567")
+        return
 
-        await state.update_data(main_phone=phone)
-
-        await message.answer(
-            "☎️ Endi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX",
-            reply_markup=make_keyboard([], add_cancel=True)
-        )
-        await state.set_state(RegisterStates.waiting_extra_phone)
-
-    except Exception as e:
-        logging.exception("main_phone_text_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+    await state.update_data(main_phone=phone)
+    await message.answer("☎️ Endi QO'SHIMCHA raqamni yozing\nFormat: +998XXXXXXXXX")
+    await state.set_state(RegisterStates.waiting_extra_phone)
 
 
 @dp.message(RegisterStates.waiting_extra_phone, F.text)
 async def extra_phone_text_handler(message: Message, state: FSMContext):
+    text = normalize_text(message.text)
+
+    if text == "/cancel":
+        await cancel_flow(state, target_message=message)
+        return
+
+    extra_phone = normalize_phone(text)
+    if not is_valid_uz_phone(extra_phone):
+        await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Masalan: +998901234567")
+        return
+
+    data = await state.get_data()
+    main_phone = data.get("main_phone", "")
+
+    if not main_phone:
+        await message.answer("⚠️ Asosiy raqam topilmadi. Qaytadan /start bosing.")
+        await state.clear()
+        return
+
+    if extra_phone == main_phone:
+        await message.answer("⚠️ Qo'shimcha raqam asosiy raqam bilan bir xil bo'lmasin.")
+        return
+
+    await state.update_data(extra_phone=extra_phone)
+    await show_confirm_step(message, state)
+
+
+@dp.callback_query(RegisterStates.confirm_save, F.data == "save_rewrite")
+async def rewrite_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.message:
+        await callback.message.edit_text("📱 Asosiy raqamni qayta kiriting\nFormat: +998XXXXXXXXX")
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(RegisterStates.waiting_main_phone)
+    await callback.answer()
+
+
+@dp.callback_query(RegisterStates.confirm_save, F.data == "save_yes")
+async def confirm_save_callback(callback: CallbackQuery, state: FSMContext):
     try:
-        text = normalize_text(message.text)
-
-        if text == "❌ Bekor qilish":
-            await cancel_flow(message, state)
-            return
-
-        extra_phone = normalize_phone(text)
-        if not is_valid_uz_phone(extra_phone):
-            await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Masalan: +998901234567")
-            return
-
-        data = await state.get_data()
-        main_phone = data.get("main_phone", "")
-
-        if not main_phone:
-            await message.answer("⚠️ Asosiy raqam topilmadi. Qaytadan /start bosing.")
-            await state.clear()
-            return
-
-        if extra_phone == main_phone:
-            await message.answer("⚠️ Qo'shimcha raqam asosiy raqam bilan bir xil bo'lmasin.")
-            return
-
-        await state.update_data(extra_phone=extra_phone)
-        await show_confirm_step(message, state)
-
-    except Exception as e:
-        logging.exception("extra_phone_text_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
-
-
-@dp.message(RegisterStates.confirm_save, F.text)
-async def confirm_save_handler(message: Message, state: FSMContext):
-    try:
-        text = normalize_text(message.text)
         data = await state.get_data()
 
-        if text == "✏️ Qayta kiritish":
-            await message.answer(
-                "📱 Asosiy raqamni qayta kiriting\nFormat: +998XXXXXXXXX",
-                reply_markup=make_keyboard([], add_cancel=True)
-            )
-            await state.set_state(RegisterStates.waiting_main_phone)
+        if not callback.from_user:
+            await callback.answer("Foydalanuvchi aniqlanmadi", show_alert=True)
             return
 
-        if text != "✅ Tasdiqlash":
-            await message.answer("⚠️ Iltimos, tugmalardan birini tanlang.")
-            return
-
-        if not message.from_user:
-            await message.answer("❌ Foydalanuvchi aniqlanmadi.")
-            return
-
-        user_id = message.from_user.id
+        user_id = callback.from_user.id
 
         async with user_locks[user_id]:
             await save_full_data_to_sheet(
@@ -885,43 +1104,125 @@ async def confirm_save_handler(message: Message, state: FSMContext):
                 education=data.get("education", ""),
                 main_phone=data.get("main_phone", ""),
                 extra_phone=data.get("extra_phone", ""),
-                telegram_id=str(message.from_user.id),
-                telegram_username=message.from_user.username or "",
-                telegram_full_name=message.from_user.full_name or "",
+                telegram_id=str(callback.from_user.id),
+                telegram_username=callback.from_user.username or "",
+                telegram_full_name=callback.from_user.full_name or "",
             )
 
-        await message.answer(
-            "✅ Ma'lumot muvaffaqiyatli saqlandi\n\n"
-            f"🎓 Ta'lim shakli: {data.get('education', '')}\n"
-            f"📚 Kurs: {data.get('course', '')}\n"
-            f"👥 Guruh: {data.get('group', '')}\n"
-            f"🧑‍🎓 Talaba: {data.get('student', '')}\n"
-            f"📱 Asosiy raqam: {data.get('main_phone', '')}\n"
-            f"☎️ Qo'shimcha raqam: {data.get('extra_phone', '')}\n"
-            f"🆔 Telegram ID: {message.from_user.id}",
-            reply_markup=ReplyKeyboardRemove()
-        )
         await state.clear()
 
+        if callback.message:
+            await callback.message.edit_text(
+                "✅ Ma'lumot muvaffaqiyatli saqlandi\n\n"
+                f"🎓 Ta'lim shakli: {data.get('education', '')}\n"
+                f"📚 Kurs: {data.get('course', '')}\n"
+                f"👥 Guruh: {data.get('group', '')}\n"
+                f"🧑‍🎓 Talaba: {data.get('student', '')}\n"
+                f"📱 Asosiy raqam: {data.get('main_phone', '')}\n"
+                f"☎️ Qo'shimcha raqam: {data.get('extra_phone', '')}\n"
+                f"🆔 Telegram ID: {callback.from_user.id}"
+            )
+        await callback.answer("Saqlandi")
+
     except Exception as e:
-        logging.exception("confirm_save_handler xatolik: %s", e)
-        await message.answer(f"❌ {str(e)}")
+        logging.exception("confirm_save_callback xatolik: %s", e)
+        if callback.message:
+            await callback.message.answer(f"❌ {str(e)}")
+        await callback.answer()
 
 
+# =========================
+# RECOVERY FLOW
+# =========================
+@dp.message(RegisterStates.recover_main_phone, F.text)
+async def recover_main_phone_handler(message: Message, state: FSMContext):
+    text = normalize_text(message.text)
+
+    if text == "/cancel":
+        await cancel_flow(state, target_message=message)
+        return
+
+    phone = normalize_phone(text)
+    if not is_valid_uz_phone(phone):
+        await message.answer("⚠️ Asosiy raqam noto'g'ri. Masalan: +998901234567")
+        return
+
+    await state.update_data(recover_main_phone=phone)
+    await message.answer("☎️ Endi eski QO'SHIMCHA raqamni kiriting\nFormat: +998XXXXXXXXX")
+    await state.set_state(RegisterStates.recover_extra_phone)
+
+
+@dp.message(RegisterStates.recover_extra_phone, F.text)
+async def recover_extra_phone_handler(message: Message, state: FSMContext):
+    text = normalize_text(message.text)
+
+    if text == "/cancel":
+        await cancel_flow(state, target_message=message)
+        return
+
+    extra_phone = normalize_phone(text)
+    if not is_valid_uz_phone(extra_phone):
+        await message.answer("⚠️ Qo'shimcha raqam noto'g'ri. Masalan: +998901234567")
+        return
+
+    data = await state.get_data()
+    main_phone = data.get("recover_main_phone", "")
+
+    if extra_phone == main_phone:
+        await message.answer("⚠️ Qo'shimcha raqam asosiy raqam bilan bir xil bo'lmasin.")
+        return
+
+    snapshot = await fetch_sheet_snapshot()
+    found = find_student_by_phones(snapshot, main_phone, extra_phone)
+
+    if not found:
+        await message.answer("❌ Bunday raqamlar juftligi topilmadi.")
+        return
+
+    if not message.from_user:
+        await message.answer("❌ Foydalanuvchi aniqlanmadi.")
+        return
+
+    async with user_locks[message.from_user.id]:
+        await rebind_telegram_owner(
+            main_phone=main_phone,
+            extra_phone=extra_phone,
+            telegram_id=str(message.from_user.id),
+            username=message.from_user.username or "",
+            full_name=message.from_user.full_name or "",
+        )
+
+    await state.clear()
+    await message.answer(
+        "✅ Akkaunt muvaffaqiyatli tiklandi.\n\n"
+        f"🎓 Ta'lim shakli: {found['education']}\n"
+        f"📚 Kurs: {found['course']}\n"
+        f"👥 Guruh: {found['group']}\n"
+        f"🧑‍🎓 Talaba: {found['student']}\n"
+        f"📱 Asosiy raqam: {found['main_phone']}\n"
+        f"☎️ Qo'shimcha raqam: {found['extra_phone']}\n"
+        f"🆔 Yangi Telegram ID: {message.from_user.id}"
+    )
+
+
+# =========================
+# ADMIN
+# =========================
 @dp.message(Command("admin"))
-async def admin_handler(message: Message, state: FSMContext):
+async def admin_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         await message.answer("⛔ Siz admin emassiz.")
         return
 
-    await state.clear()
     await message.answer(
-        "🛠 Admin panel\nKerakli bo'limni tanlang:",
-        reply_markup=admin_keyboard()
+        "🛠 Admin buyruqlari:\n\n"
+        "/stats - statistika\n"
+        "/find <matn> - qidiruv\n"
+        "/refresh - jadvalni tekshirish"
     )
 
 
-@dp.message(F.text == "📊 Statistika")
+@dp.message(Command("stats"))
 async def admin_stats_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
@@ -938,45 +1239,34 @@ async def admin_stats_handler(message: Message):
         await message.answer(f"❌ {str(e)}")
 
 
-@dp.message(F.text == "🔄 Yangilash")
+@dp.message(Command("refresh"))
 async def admin_refresh_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
 
     try:
         _ = await fetch_sheet_snapshot()
-        await message.answer("✅ Jadval tekshirildi. Yangi talabalar va o'chirilganlar darrov qabul qilinadi.")
+        await message.answer("✅ Jadval tekshirildi.")
     except Exception as e:
         await message.answer(f"❌ {str(e)}")
 
 
-@dp.message(F.text == "🔎 Qidiruv")
-async def admin_search_start_handler(message: Message, state: FSMContext):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    await state.set_state(RegisterStates.admin_search)
-    await message.answer(
-        "🔎 Qidiruv uchun talaba F.I.SH. yoki guruh yozing:",
-        reply_markup=make_keyboard([], add_cancel=True)
-    )
-
-
-@dp.message(RegisterStates.admin_search, F.text)
-async def admin_search_handler(message: Message, state: FSMContext):
+@dp.message(Command("find"))
+async def admin_find_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
 
     text = normalize_text(message.text)
-    if text == "❌ Bekor qilish":
-        await cancel_flow(message, state)
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("🔎 Qidiruv uchun: /find talaba_yoki_guruh")
         return
 
+    query = parts[1]
     try:
-        results = await search_students(text)
+        results = await search_students(query)
         if not results:
-            await message.answer("ℹ️ Hech narsa topilmadi.", reply_markup=admin_keyboard())
-            await state.clear()
+            await message.answer("ℹ️ Hech narsa topilmadi.")
             return
 
         chunks = []
@@ -990,25 +1280,9 @@ async def admin_search_handler(message: Message, state: FSMContext):
                 f"🧾 Yuborish soni: {item['count'] or '0'}"
             )
 
-        await message.answer(
-            "🔎 Qidiruv natijalari\n\n" + "\n\n".join(chunks),
-            reply_markup=admin_keyboard()
-        )
-        await state.clear()
+        await message.answer("🔎 Qidiruv natijalari\n\n" + "\n\n".join(chunks))
     except Exception as e:
         await message.answer(f"❌ {str(e)}")
-
-
-@dp.message(F.text == "🏠 Chiqish")
-async def admin_exit_handler(message: Message, state: FSMContext):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-
-    await state.clear()
-    await message.answer(
-        "✅ Admin paneldan chiqildi.",
-        reply_markup=ReplyKeyboardRemove()
-    )
 
 
 @dp.message()
