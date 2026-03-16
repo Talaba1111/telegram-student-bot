@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -26,6 +27,7 @@ GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()
+SNAPSHOT_TTL = int(os.getenv("SNAPSHOT_TTL", "60"))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi")
@@ -43,7 +45,15 @@ logging.basicConfig(
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
 user_locks = defaultdict(asyncio.Lock)
+sheet_semaphore = asyncio.Semaphore(5)
+snapshot_lock = asyncio.Lock()
+
+_snapshot_cache = {
+    "data": None,
+    "expires_at": 0.0,
+}
 
 
 class FormState(StatesGroup):
@@ -57,6 +67,13 @@ class FormState(StatesGroup):
     confirm_edit = State()
     recover_main = State()
     recover_extra = State()
+
+
+# =========================
+# HELPERS
+# =========================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def norm(v) -> str:
@@ -79,16 +96,20 @@ def valid_phone(v: str) -> bool:
 
 
 def unique(values: List[str]) -> List[str]:
-    res = []
+    result = []
     for v in values:
         v = norm(v)
-        if v and v not in res:
-            res.append(v)
-    return res
+        if v and v not in result:
+            result.append(v)
+    return result
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def column_letter(n: int) -> str:
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
 
 def paginated_keyboard(
@@ -101,6 +122,7 @@ def paginated_keyboard(
 ) -> InlineKeyboardMarkup:
     total_pages = max(1, (len(items) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
+
     start = page * page_size
     end = start + page_size
     page_items = items[start:end]
@@ -129,6 +151,7 @@ def paginated_keyboard(
         bottom.append(InlineKeyboardButton(text="🔙 Orqaga", callback_data=back_cb))
     bottom.append(InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel"))
     rows.append(bottom)
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -179,6 +202,15 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineK
         raise
 
 
+async def cancel_flow(state: FSMContext, message: Optional[Message] = None, callback: Optional[CallbackQuery] = None):
+    await state.clear()
+    text = "❌ Amal bekor qilindi.\nQayta boshlash uchun /start bosing."
+    if callback and callback.message:
+        await safe_edit(callback, text, None)
+    elif message:
+        await message.answer(text)
+
+
 async def check_subscription(user_id: int) -> bool:
     if not REQUIRED_CHANNEL:
         return True
@@ -193,6 +225,9 @@ async def check_subscription(user_id: int) -> bool:
         return False
 
 
+# =========================
+# GOOGLE SHEETS CORE
+# =========================
 def get_credentials():
     creds = json.loads(GOOGLE_CREDENTIALS_JSON)
     if "private_key" in creds:
@@ -216,76 +251,129 @@ async def get_worksheet():
         raise ValueError(f"Google Sheets ulanishida xatolik: {e}")
 
 
-async def get_headers(ws) -> List[str]:
-    return await asyncio.to_thread(lambda: [str(h).strip() for h in ws.row_values(1)])
+async def load_sheet_matrix(ws):
+    return await asyncio.to_thread(ws.get_all_values)
 
 
-async def get_all_records(ws):
-    return await asyncio.to_thread(ws.get_all_records)
+def get_header_map_from_matrix(matrix: List[List[str]]) -> Dict[str, int]:
+    if not matrix:
+        raise ValueError("Google Sheets bo'sh")
+    headers = matrix[0]
+    header_map = {}
+    for idx, h in enumerate(headers, start=1):
+        header_map[norm_header(h)] = idx
+    return header_map
 
 
-async def get_col_name(ws, possible_names: List[str]) -> Optional[str]:
-    headers = await get_headers(ws)
-    mapping = {norm_header(h): h for h in headers}
+def find_column_index(header_map: Dict[str, int], possible_names: List[str]) -> Optional[int]:
     for name in possible_names:
         key = norm_header(name)
-        if key in mapping:
-            return mapping[key]
+        if key in header_map:
+            return header_map[key]
     return None
 
 
-async def get_col_index(ws, col_name: str) -> Optional[int]:
-    headers = await get_headers(ws)
-    for i, h in enumerate(headers, start=1):
-        if norm_header(h) == norm_header(col_name):
-            return i
-    return None
+def get_required_column_indexes(header_map: Dict[str, int]) -> Dict[str, int]:
+    education_col = find_column_index(header_map, ["Ta'lim shakli", "Ta’lim shakli", "Talim shakli"])
+    course_col = find_column_index(header_map, ["Kurs"])
+    group_col = find_column_index(header_map, ["Guruh", "Group"])
+    student_col = find_column_index(header_map, ["F.I.SH.", "F.I.SH", "FISH", "FIO", "Talaba"])
+
+    if not education_col:
+        raise ValueError("Google Sheetsda Ta'lim shakli ustuni topilmadi")
+    if not course_col:
+        raise ValueError("Google Sheetsda Kurs ustuni topilmadi")
+    if not group_col:
+        raise ValueError("Google Sheetsda Guruh ustuni topilmadi")
+    if not student_col:
+        raise ValueError("Google Sheetsda F.I.SH. ustuni topilmadi")
+
+    return {
+        "education": education_col,
+        "course": course_col,
+        "group": group_col,
+        "student": student_col,
+    }
 
 
 async def ensure_extra_columns(ws):
-    headers = await get_headers(ws)
-    needed = [
-        "Asosiy nomer",
-        "Qo'shimcha nomer",
-        "Telegram ID",
-        "Telegram Username",
-        "Telegram Full Name",
-        "Oxirgi yangilanish",
-        "Yuborish soni",
-    ]
-    current = headers[:]
-    for col in needed:
-        if col not in current:
-            await asyncio.to_thread(ws.update_cell, 1, len(current) + 1, col)
-            current.append(col)
+    async with sheet_semaphore:
+        matrix = await load_sheet_matrix(ws)
+        if not matrix:
+            raise ValueError("Google Sheets bo'sh")
+
+        headers = matrix[0]
+        needed = [
+            "Asosiy nomer",
+            "Qo'shimcha nomer",
+            "Telegram ID",
+            "Telegram Username",
+            "Telegram Full Name",
+            "Oxirgi yangilanish",
+            "Yuborish soni",
+        ]
+
+        changed = False
+        for col in needed:
+            if col not in headers:
+                headers.append(col)
+                changed = True
+
+        if changed:
+            range_name = f"A1:{column_letter(len(headers))}1"
+            await asyncio.to_thread(ws.update, range_name, [headers])
 
 
-async def get_required_columns(ws) -> Dict[str, str]:
-    education = await get_col_name(ws, ["Ta'lim shakli", "Ta’lim shakli", "Talim shakli"])
-    course = await get_col_name(ws, ["Kurs"])
-    group = await get_col_name(ws, ["Guruh", "Group"])
-    student = await get_col_name(ws, ["F.I.SH.", "F.I.SH", "FISH", "FIO", "Talaba"])
-
-    if not education:
-        raise ValueError("Google Sheetsda Ta'lim shakli ustuni topilmadi")
-    if not course:
-        raise ValueError("Google Sheetsda Kurs ustuni topilmadi")
-    if not group:
-        raise ValueError("Google Sheetsda Guruh ustuni topilmadi")
-    if not student:
-        raise ValueError("Google Sheetsda F.I.SH. ustuni topilmadi")
-
-    return {"education": education, "course": course, "group": group, "student": student}
+def invalidate_snapshot_cache():
+    _snapshot_cache["data"] = None
+    _snapshot_cache["expires_at"] = 0.0
 
 
-async def fetch_snapshot() -> Dict:
-    ws = await get_worksheet()
-    await ensure_extra_columns(ws)
-    records = await get_all_records(ws)
-    cols = await get_required_columns(ws)
-    return {"records": records, "columns": cols}
+async def fetch_snapshot(force: bool = False) -> Dict:
+    now = time.time()
+    if not force and _snapshot_cache["data"] is not None and _snapshot_cache["expires_at"] > now:
+        return _snapshot_cache["data"]
+
+    async with snapshot_lock:
+        now = time.time()
+        if not force and _snapshot_cache["data"] is not None and _snapshot_cache["expires_at"] > now:
+            return _snapshot_cache["data"]
+
+        ws = await get_worksheet()
+        await ensure_extra_columns(ws)
+
+        async with sheet_semaphore:
+            matrix = await load_sheet_matrix(ws)
+
+        header_map = get_header_map_from_matrix(matrix)
+        required = get_required_column_indexes(header_map)
+
+        headers = matrix[0]
+        records = []
+        for row in matrix[1:]:
+            row_dict = {}
+            for i, header in enumerate(headers):
+                row_dict[header] = row[i] if i < len(row) else ""
+            records.append(row_dict)
+
+        data = {
+            "records": records,
+            "columns": {
+                "education": headers[required["education"] - 1],
+                "course": headers[required["course"] - 1],
+                "group": headers[required["group"] - 1],
+                "student": headers[required["student"] - 1],
+            },
+        }
+
+        _snapshot_cache["data"] = data
+        _snapshot_cache["expires_at"] = time.time() + SNAPSHOT_TTL
+        return data
 
 
+# =========================
+# SNAPSHOT HELPERS
+# =========================
 def snapshot_educations(snap: Dict) -> List[str]:
     cols = snap["columns"]
     return unique([norm(r.get(cols["education"], "")) for r in snap["records"]])
@@ -353,20 +441,9 @@ def registration_by_phones(snap: Dict, main_phone: str, extra_phone: str) -> Opt
     return None
 
 
-async def find_row_index(ws, student: str, course: str, group: str, education: str) -> Optional[int]:
-    rows = await get_all_records(ws)
-    cols = await get_required_columns(ws)
-    for i, row in enumerate(rows, start=2):
-        if (
-            norm(row.get(cols["student"], "")) == student
-            and norm(row.get(cols["course"], "")) == course
-            and norm(row.get(cols["group"], "")) == group
-            and norm(row.get(cols["education"], "")) == education
-        ):
-            return i
-    return None
-
-
+# =========================
+# WRITE OPERATIONS
+# =========================
 async def save_registration(
     student: str,
     course: str,
@@ -380,103 +457,145 @@ async def save_registration(
 ):
     ws = await get_worksheet()
     await ensure_extra_columns(ws)
-    row_index = await find_row_index(ws, student, course, group, education)
-    if not row_index:
-        raise ValueError("Tanlangan talaba jadvaldan topilmadi")
 
-    rows = await get_all_records(ws)
-    cols = await get_required_columns(ws)
+    async with sheet_semaphore:
+        matrix = await load_sheet_matrix(ws)
 
-    for i, row in enumerate(rows, start=2):
-        row_tg_id = norm(row.get("Telegram ID", ""))
-        if row_tg_id == telegram_id and i != row_index:
-            student_name = norm(row.get(cols["student"], ""))
-            raise ValueError(f"Bu Telegram ID boshqa talabaga biriktirilgan: {student_name}")
+    header_map = get_header_map_from_matrix(matrix)
+    required = get_required_column_indexes(header_map)
 
-    main_col = await get_col_index(ws, "Asosiy nomer")
-    extra_col = await get_col_index(ws, "Qo'shimcha nomer")
-    tg_id_col = await get_col_index(ws, "Telegram ID")
-    tg_user_col = await get_col_index(ws, "Telegram Username")
-    tg_name_col = await get_col_index(ws, "Telegram Full Name")
-    upd_col = await get_col_index(ws, "Oxirgi yangilanish")
-    cnt_col = await get_col_index(ws, "Yuborish soni")
+    main_col = find_column_index(header_map, ["Asosiy nomer"])
+    extra_col = find_column_index(header_map, ["Qo'shimcha nomer"])
+    tg_id_col = find_column_index(header_map, ["Telegram ID"])
+    tg_user_col = find_column_index(header_map, ["Telegram Username"])
+    tg_name_col = find_column_index(header_map, ["Telegram Full Name"])
+    upd_col = find_column_index(header_map, ["Oxirgi yangilanish"])
+    cnt_col = find_column_index(header_map, ["Yuborish soni"])
 
-    existing_main = norm((await asyncio.to_thread(ws.cell, row_index, main_col)).value) if main_col else ""
-    existing_extra = norm((await asyncio.to_thread(ws.cell, row_index, extra_col)).value) if extra_col else ""
+    if not all([main_col, extra_col, tg_id_col, tg_user_col, tg_name_col, upd_col, cnt_col]):
+        raise ValueError("Qo'shimcha ustunlar topilmadi")
+
+    row_index = None
+    existing_main = ""
+    existing_extra = ""
     current_count = 0
-    if cnt_col:
-        val = (await asyncio.to_thread(ws.cell, row_index, cnt_col)).value
-        if val:
+
+    for i, row in enumerate(matrix[1:], start=2):
+        def cell(col_num: int) -> str:
+            idx = col_num - 1
+            return row[idx].strip() if idx < len(row) else ""
+
+        row_student = cell(required["student"])
+        row_course = cell(required["course"])
+        row_group = cell(required["group"])
+        row_education = cell(required["education"])
+        row_tg_id = cell(tg_id_col)
+
+        if row_tg_id == telegram_id:
+            same_student = (
+                row_student == student
+                and row_course == course
+                and row_group == group
+                and row_education == education
+            )
+            if not same_student:
+                raise ValueError(f"Bu Telegram ID allaqachon boshqa talabaga biriktirilgan: {row_student}")
+
+        if (
+            row_student == student
+            and row_course == course
+            and row_group == group
+            and row_education == education
+        ):
+            row_index = i
+            existing_main = cell(main_col)
+            existing_extra = cell(extra_col)
+            cnt_raw = cell(cnt_col)
             try:
-                current_count = int(str(val).strip())
+                current_count = int(cnt_raw) if cnt_raw else 0
             except Exception:
                 current_count = 0
+
+    if not row_index:
+        raise ValueError("Tanlangan talaba jadvaldan topilmadi")
 
     if existing_main == main_phone and existing_extra == extra_phone:
         raise ValueError("Bu ma'lumot avval ham saqlangan")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cells = []
-    if main_col:
-        cells.append(Cell(row_index, main_col, main_phone))
-    if extra_col:
-        cells.append(Cell(row_index, extra_col, extra_phone))
-    if tg_id_col:
-        cells.append(Cell(row_index, tg_id_col, telegram_id))
-    if tg_user_col:
-        cells.append(Cell(row_index, tg_user_col, telegram_username))
-    if tg_name_col:
-        cells.append(Cell(row_index, tg_name_col, telegram_full_name))
-    if upd_col:
-        cells.append(Cell(row_index, upd_col, now_str))
-    if cnt_col:
-        cells.append(Cell(row_index, cnt_col, str(current_count + 1)))
 
-    if cells:
+    cells = [
+        Cell(row_index, main_col, main_phone),
+        Cell(row_index, extra_col, extra_phone),
+        Cell(row_index, tg_id_col, telegram_id),
+        Cell(row_index, tg_user_col, telegram_username),
+        Cell(row_index, tg_name_col, telegram_full_name),
+        Cell(row_index, upd_col, now_str),
+        Cell(row_index, cnt_col, str(current_count + 1)),
+    ]
+
+    async with sheet_semaphore:
         await asyncio.to_thread(ws.update_cells, cells)
+
+    invalidate_snapshot_cache()
 
 
 async def rebind_account(main_phone: str, extra_phone: str, telegram_id: str, username: str, full_name: str):
     ws = await get_worksheet()
     await ensure_extra_columns(ws)
-    rows = await get_all_records(ws)
-    cols = await get_required_columns(ws)
+
+    async with sheet_semaphore:
+        matrix = await load_sheet_matrix(ws)
+
+    header_map = get_header_map_from_matrix(matrix)
+    required = get_required_column_indexes(header_map)
+
+    main_col = find_column_index(header_map, ["Asosiy nomer"])
+    extra_col = find_column_index(header_map, ["Qo'shimcha nomer"])
+    tg_id_col = find_column_index(header_map, ["Telegram ID"])
+    tg_user_col = find_column_index(header_map, ["Telegram Username"])
+    tg_name_col = find_column_index(header_map, ["Telegram Full Name"])
+    upd_col = find_column_index(header_map, ["Oxirgi yangilanish"])
+
+    if not all([main_col, extra_col, tg_id_col, tg_user_col, tg_name_col, upd_col]):
+        raise ValueError("Qo'shimcha ustunlar topilmadi")
 
     target_index = None
-    for i, row in enumerate(rows, start=2):
-        if norm(row.get("Asosiy nomer", "")) == main_phone and norm(row.get("Qo'shimcha nomer", "")) == extra_phone:
+
+    for i, row in enumerate(matrix[1:], start=2):
+        def cell(col_num: int) -> str:
+            idx = col_num - 1
+            return row[idx].strip() if idx < len(row) else ""
+
+        row_student = cell(required["student"])
+        row_tg_id = cell(tg_id_col)
+
+        if row_tg_id == telegram_id:
+            raise ValueError(f"Bu Telegram ID allaqachon boshqa talabaga biriktirilgan: {row_student}")
+
+        if cell(main_col) == main_phone and cell(extra_col) == extra_phone:
             target_index = i
-            break
 
     if not target_index:
         raise ValueError("Bunday raqamlar juftligi topilmadi")
 
-    for i, row in enumerate(rows, start=2):
-        row_tg_id = norm(row.get("Telegram ID", ""))
-        if row_tg_id == telegram_id and i != target_index:
-            student_name = norm(row.get(cols["student"], ""))
-            raise ValueError(f"Bu Telegram ID boshqa talabaga biriktirilgan: {student_name}")
-
-    tg_id_col = await get_col_index(ws, "Telegram ID")
-    tg_user_col = await get_col_index(ws, "Telegram Username")
-    tg_name_col = await get_col_index(ws, "Telegram Full Name")
-    upd_col = await get_col_index(ws, "Oxirgi yangilanish")
-
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cells = []
-    if tg_id_col:
-        cells.append(Cell(target_index, tg_id_col, telegram_id))
-    if tg_user_col:
-        cells.append(Cell(target_index, tg_user_col, username))
-    if tg_name_col:
-        cells.append(Cell(target_index, tg_name_col, full_name))
-    if upd_col:
-        cells.append(Cell(target_index, upd_col, now_str))
+    cells = [
+        Cell(target_index, tg_id_col, telegram_id),
+        Cell(target_index, tg_user_col, username),
+        Cell(target_index, tg_name_col, full_name),
+        Cell(target_index, upd_col, now_str),
+    ]
 
-    if cells:
+    async with sheet_semaphore:
         await asyncio.to_thread(ws.update_cells, cells)
 
+    invalidate_snapshot_cache()
 
+
+# =========================
+# FLOW
+# =========================
 async def show_confirm(message: Message, state: FSMContext):
     data = await state.get_data()
     text = (
@@ -491,15 +610,6 @@ async def show_confirm(message: Message, state: FSMContext):
     )
     await message.answer(text, reply_markup=confirm_keyboard())
     await state.set_state(FormState.confirm_save)
-
-
-async def cancel_flow(state: FSMContext, message: Optional[Message] = None, callback: Optional[CallbackQuery] = None):
-    await state.clear()
-    text = "❌ Amal bekor qilindi.\nQayta boshlash uchun /start bosing."
-    if callback and callback.message:
-        await safe_edit(callback, text, None)
-    elif message:
-        await message.answer(text, reply_markup=ReplyKeyboardRemove())
 
 
 # =========================
@@ -865,6 +975,7 @@ async def confirm_save(callback: CallbackQuery, state: FSMContext):
             )
 
         await state.clear()
+
         await safe_edit(
             callback,
             "✅ Ma'lumot muvaffaqiyatli saqlandi\n\n"
@@ -967,7 +1078,7 @@ async def recover_extra_input(message: Message, state: FSMContext):
         await message.answer("⚠️ Qo'shimcha raqam asosiy raqam bilan bir xil bo'lmasin.")
         return
 
-    snap = await fetch_snapshot()
+    snap = await fetch_snapshot(force=True)
     found = registration_by_phones(snap, main_phone, phone)
     if not found:
         await message.answer("❌ Bunday raqamlar juftligi topilmadi.")
@@ -1002,6 +1113,47 @@ async def recover_extra_input(message: Message, state: FSMContext):
 # =========================
 # ADMIN
 # =========================
+async def get_sheet_stats() -> Tuple[int, int, int]:
+    snap = await fetch_snapshot(force=True)
+    records = snap["records"]
+    cols = snap["columns"]
+
+    total_students = len(records)
+    total_groups = len(set(
+        (norm(r.get(cols["education"], "")), norm(r.get(cols["course"], "")), norm(r.get(cols["group"], "")))
+        for r in records
+    ))
+    total_educations = len(set(norm(r.get(cols["education"], "")) for r in records if norm(r.get(cols["education"], ""))))
+    return total_students, total_groups, total_educations
+
+
+async def search_students(keyword: str) -> List[dict]:
+    snap = await fetch_snapshot(force=True)
+    records = snap["records"]
+    cols = snap["columns"]
+    keyword = norm(keyword).lower()
+
+    found = []
+    for row in records:
+        student = norm(row.get(cols["student"], ""))
+        group = norm(row.get(cols["group"], ""))
+        course = norm(row.get(cols["course"], ""))
+        education = norm(row.get(cols["education"], ""))
+
+        if keyword in student.lower() or keyword in group.lower():
+            found.append({
+                "student": student,
+                "group": group,
+                "course": course,
+                "education": education,
+                "main_phone": norm(row.get("Asosiy nomer", "")),
+                "extra_phone": norm(row.get("Qo'shimcha nomer", "")),
+                "telegram_id": norm(row.get("Telegram ID", "")),
+                "count": norm(row.get("Yuborish soni", "")),
+            })
+    return found[:10]
+
+
 @dp.message(Command("admin"))
 async def admin_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1031,8 +1183,8 @@ async def admin_refresh(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     try:
-        _ = await fetch_snapshot()
-        await message.answer("✅ Jadval tekshirildi.")
+        await fetch_snapshot(force=True)
+        await message.answer("✅ Jadval yangilandi.")
     except Exception as e:
         await message.answer(f"❌ {str(e)}")
 
@@ -1071,47 +1223,6 @@ async def admin_find(message: Message):
 @dp.message()
 async def fallback_handler(message: Message):
     await message.answer("ℹ️ Qayta boshlash uchun /start bosing.")
-
-
-async def get_sheet_stats() -> Tuple[int, int, int]:
-    snap = await fetch_snapshot()
-    records = snap["records"]
-    cols = snap["columns"]
-
-    total_students = len(records)
-    total_groups = len(set(
-        (norm(r.get(cols["education"], "")), norm(r.get(cols["course"], "")), norm(r.get(cols["group"], "")))
-        for r in records
-    ))
-    total_educations = len(set(norm(r.get(cols["education"], "")) for r in records if norm(r.get(cols["education"], ""))))
-    return total_students, total_groups, total_educations
-
-
-async def search_students(keyword: str) -> List[dict]:
-    snap = await fetch_snapshot()
-    records = snap["records"]
-    cols = snap["columns"]
-    keyword = norm(keyword).lower()
-
-    found = []
-    for row in records:
-        student = norm(row.get(cols["student"], ""))
-        group = norm(row.get(cols["group"], ""))
-        course = norm(row.get(cols["course"], ""))
-        education = norm(row.get(cols["education"], ""))
-
-        if keyword in student.lower() or keyword in group.lower():
-            found.append({
-                "student": student,
-                "group": group,
-                "course": course,
-                "education": education,
-                "main_phone": norm(row.get("Asosiy nomer", "")),
-                "extra_phone": norm(row.get("Qo'shimcha nomer", "")),
-                "telegram_id": norm(row.get("Telegram ID", "")),
-                "count": norm(row.get("Yuborish soni", "")),
-            })
-    return found[:10]
 
 
 async def main():
